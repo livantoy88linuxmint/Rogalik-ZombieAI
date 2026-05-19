@@ -1,0 +1,4337 @@
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+
+// Basic 2D Perlin Noise implementation
+// Based on https://en.wikipedia.org/wiki/Perlin_noise#Implementation_details
+// and other common implementations. Not a high-performance solution, but serves the purpose.
+
+// Re-usable constants for Perlin Noise
+const int _gradientSize = 256;
+final List<int> _perm = List<int>.filled(_gradientSize * 2, 0);
+final List<Offset> _gradients = <Offset>[];
+bool _perlinInitialized = false;
+
+void _initializePerlinNoise(int seed) {
+  if (_perlinInitialized) return; // Only initialize once
+  final Random random = Random(seed);
+  for (int i = 0; i < _gradientSize; i++) {
+    _perm[i] = i;
+    double angle = random.nextDouble() * 2 * pi;
+    _gradients.add(Offset(cos(angle), sin(angle)));
+  }
+
+  for (int i = 0; i < _gradientSize; i++) {
+    int r = random.nextInt(_gradientSize);
+    int temp = _perm[i];
+    _perm[i] = _perm[r];
+    _perm[r] = temp;
+  }
+  for (int i = 0; i < _gradientSize; i++) {
+    _perm[i + _gradientSize] = _perm[i];
+  }
+  _perlinInitialized = true;
+}
+
+double _fade(double t) => t * t * t * (t * (t * 6 - 15) + 10);
+
+double _lerp(double a, double b, double t) => a + t * (b - a);
+
+double _grad(int hash, double x, double y) {
+  Offset gradient = _gradients[hash % _gradients.length];
+  return gradient.dx * x + gradient.dy * y;
+}
+
+double _perlinNoise(double x, double y, {int octaves = 1, double persistence = 0.5}) {
+  double total = 0.0;
+  double frequency = 1.0;
+  double amplitude = 1.0;
+  double maxValue = 0.0; // Used for normalizing result to 0.0 - 1.0
+
+  for (int i = 0; i < octaves; i++) {
+    double x0 = x * frequency;
+    double y0 = y * frequency;
+
+    int X = (x0.floor() & 255);
+    int Y = (y0.floor() & 255);
+
+    x0 -= x0.floor();
+    y0 -= y0.floor();
+
+    double u = _fade(x0);
+    double v = _fade(y0);
+
+    int A = _perm[X] + Y;
+    int B = _perm[X + 1] + Y;
+
+    double n00 = _grad(_perm[A], x0, y0);
+    double n10 = _grad(_perm[_perm[B]], x0 - 1, y0);
+    double n01 = _grad(_perm[A + 1], x0, y0 - 1);
+    double n11 = _grad(_perm[B + 1], x0 - 1, y0 - 1);
+
+    double nx0 = _lerp(n00, n10, u);
+    double nx1 = _lerp(n01, n11, u);
+
+    total += _lerp(nx0, nx1, v) * amplitude;
+    maxValue += amplitude;
+
+    amplitude *= persistence;
+    frequency *= 2.0;
+  }
+
+  return (total / maxValue + 1.0) / 2.0; // Normalize to 0.0 - 1.0
+}
+
+// --- Константы ---
+// MAP_WIDTH и MAP_HEIGHT теперь динамические и определяются в GameState
+const double TILE_SIZE = 10.0; // Размер каждого символьного блока
+const String FONT_FAMILY = 'monospace'; // Гарантируем моноширинный шрифт
+const int MAX_MESSAGE_LOG = 10; // Максимальное количество сообщений для отображения
+const int ZOMBIE_VISION_RANGE = 8; // Зомби видят игрока в радиусе 8x8 тайлов
+const int PISTOL_RANGE = 5; // Дальность стрельбы пистолета
+const int ZOOM_VIEW_SIZE = 17; // Размер окна при приближении (например, 17x17)
+const int FOG_OF_WAR_VISION_RADIUS = 20; // Радиус обзора для тумана войны
+const int WIDE_VIEW_SIZE = 40; // Размер окна для широкого обзора при большой карте без зума
+const int DROWNING_DAMAGE = 10; // Урон от утопления
+const int DROWNING_TURNS = 2; // Количество ходов до начала утопления
+
+// --- Игровые объекты ---
+
+/// Класс для представления позиции на карте
+class Position {
+  int x;
+  int y;
+
+  Position(this.x, this.y);
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Position &&
+          runtimeType == other.runtimeType &&
+          x == other.x &&
+          y == other.y;
+
+  @override
+  int get hashCode => x.hashCode ^ y.hashCode;
+}
+
+/// Перечисление типов тайлов на карте
+enum TileType {
+  empty('.'),
+  wall('#'),
+  player('@'), // Игрок
+  zombie('Z'),
+  healthPack('H'), // Аптечка
+  knife('K'), // Нож
+  defenseItem('D'), // Предмет для защиты
+  bush('B'), // Куст
+  chest('X'), // Ящик
+  tree('T'), // Новое препятствие: Дерево
+  water('~'), // Новое препятствие: Вода
+  boulder('O'); // НОВОЕ препятствие: Валун
+
+  final String char;
+  const TileType(this.char);
+}
+
+/// Перечисление типов предметов инвентаря
+enum ItemType {
+  healthPack,
+  knife,
+  defenseBoost,
+  sticks, // Палки
+  leaves, // Листья
+  crowbar, // Лом
+  pistol, // Пистолет
+  ammo, // Патроны
+  sharpLongStick,
+  longKnife,
+  primitiveBandage,
+  leafArmor,
+  axe, // Новый предмет: Топор
+  log, // Новый предмет: Бревно
+  improvedCrowbar, // Новый предмет: Улучшенный лом
+  woodenShield, // Новый предмет: Деревянный щит
+  stones, // НОВЫЙ предмет: Камни
+  stoneAxe, // НОВЫЙ предмет: Каменный топор
+}
+
+/// Класс для хранения данных о предмете в инвентаре
+class InventoryItem {
+  final ItemType itemType;
+  final String name;
+  final String description;
+  final int effectValue; // Например, +20 HP, +5 Strength, +1 Defense (для пистолета - урон)
+  int quantity;
+  int? currentDurability; // Новое поле для текущей прочности
+  int? maxDurability; // Новое поле для максимальной прочности
+
+  InventoryItem({
+    required this.itemType,
+    required this.name,
+    required this.description,
+    required this.effectValue,
+    this.quantity = 1,
+    this.currentDurability, // Инициализация прочности
+    this.maxDurability, // Инициализация максимальной прочности
+  });
+
+  /// Фабричный метод для создания предмета по его типу
+  factory InventoryItem.fromType(ItemType type) {
+    switch (type) {
+      case ItemType.healthPack:
+        return InventoryItem(
+          itemType: ItemType.healthPack,
+          name: "Аптечка",
+          description: "Восстанавливает 20 здоровья.",
+          effectValue: 20,
+        );
+      case ItemType.knife:
+        return InventoryItem(
+          itemType: ItemType.knife,
+          name: "Нож",
+          description: "Увеличивает силу на 5.",
+          effectValue: 5,
+        );
+      case ItemType.defenseBoost:
+        return InventoryItem(
+          itemType: ItemType.defenseBoost,
+          name: "Броня",
+          description: "Увеличивает защиту на 1.",
+          effectValue: 1,
+        );
+      case ItemType.sticks: // Палки
+        return InventoryItem(
+          itemType: ItemType.sticks,
+          name: "Палки",
+          description: "Обычные палки, используются для крафта.",
+          effectValue: 0,
+        );
+      case ItemType.leaves: // Листья
+        return InventoryItem(
+          itemType: ItemType.leaves,
+          name: "Листья",
+          description: "Обычные листья, используются для крафта.",
+          effectValue: 0,
+        );
+      case ItemType.crowbar: // Лом (Теперь с прочностью)
+        const int crowbarMaxUses = 2; // Максимальная прочность лома
+        return InventoryItem(
+          itemType: ItemType.crowbar,
+          name: "Лом",
+          description: "Прочный лом, который поможет открыть запертые ящики или валуны.",
+          effectValue: 0,
+          currentDurability: crowbarMaxUses, // Изначальная прочность
+          maxDurability: crowbarMaxUses, // Максимальная прочность
+        );
+      case ItemType.pistol: // Пистолет
+        return InventoryItem(
+          itemType: ItemType.pistol,
+          name: "Пистолет",
+          description: "Наносит 25 урона по врагу на расстоянии.",
+          effectValue: 25, // Урон от пистолета
+        );
+      case ItemType.ammo: // Патроны
+        return InventoryItem(
+          itemType: ItemType.ammo,
+          name: "Патроны",
+          description: "Боеприпасы для пистолета. Можно найти в ящиках.",
+          effectValue: 0,
+        );
+      case ItemType.sharpLongStick:
+        return InventoryItem(
+          itemType: ItemType.sharpLongStick,
+          name: "Острая длинная палка",
+          description: "Обмотанная листьями, увеличивает силу на 20.",
+          effectValue: 20, // Strength boost
+        );
+      case ItemType.longKnife:
+        return InventoryItem(
+          itemType: ItemType.longKnife,
+          name: "Длинный нож",
+          description: "Увеличивает силу на 30.",
+          effectValue: 30, // Strength boost
+        );
+      case ItemType.primitiveBandage:
+        return InventoryItem(
+          itemType: ItemType.primitiveBandage,
+          name: "Примитивный бинт",
+          description: "Восстанавливает 10 здоровья.",
+          effectValue: 10, // HP restore
+        );
+      case ItemType.leafArmor:
+        return InventoryItem(
+          itemType: ItemType.leafArmor,
+          name: "Броня из листьев",
+          description: "Увеличивает защиту на 2.",
+          effectValue: 2, // Defense boost
+        );
+      case ItemType.axe: // Измененный: Топор из ящика, теперь рубит 2 дерева
+        const int axeMaxUses = 2;
+        return InventoryItem(
+          itemType: ItemType.axe,
+          name: "Топор",
+          description: "Инструмент для рубки деревьев. Срубает до двух деревьев.",
+          effectValue: 0, // Урон не наносит, только рубит
+          currentDurability: axeMaxUses,
+          maxDurability: axeMaxUses,
+        );
+      case ItemType.log: // Новый: Бревно
+        return InventoryItem(
+          itemType: ItemType.log,
+          name: "Бревно",
+          description: "Крепкое бревно, полезно для крафта.",
+          effectValue: 0,
+        );
+      case ItemType.improvedCrowbar: // Новый: Улучшенный лом
+        const int improvedCrowbarMaxUses = 5;
+        return InventoryItem(
+          itemType: ItemType.improvedCrowbar,
+          name: "Улучшенный лом",
+          description: "Очень прочный лом, открывает до 5 ящиков или валунов.",
+          effectValue: 0,
+          currentDurability: improvedCrowbarMaxUses,
+          maxDurability: improvedCrowbarMaxUses,
+        );
+      case ItemType.woodenShield: // Новый: Деревянный щит
+        return InventoryItem(
+          itemType: ItemType.woodenShield,
+          name: "Деревянный щит",
+          description: "Примитивный щит. Увеличивает защиту на 5.",
+          effectValue: 5, // Defense boost
+        );
+      case ItemType.stones: // НОВЫЙ: Камни
+        return InventoryItem(
+          itemType: ItemType.stones,
+          name: "Камни",
+          description: "Обычные камни, используются для крафта.",
+          effectValue: 0,
+        );
+      case ItemType.stoneAxe: // НОВЫЙ: Каменный топор
+        const int stoneAxeMaxUses = 1;
+        return InventoryItem(
+          itemType: ItemType.stoneAxe,
+          name: "Каменный топор",
+          description: "Примитивный топор. Срубает 1 дерево.",
+          effectValue: 0,
+          currentDurability: stoneAxeMaxUses,
+          maxDurability: stoneAxeMaxUses,
+        );
+    }
+  }
+}
+
+/// Абстрактный класс для всех действующих лиц (игрок, зомби)
+abstract class Actor {
+  Position position;
+  int health;
+  int strength;
+  String char;
+  Color color;
+
+  Actor(this.position, this.health, this.strength, this.char, this.color);
+
+  bool isAlive() => health > 0;
+}
+
+/// Класс игрока
+class Player extends Actor {
+  List<InventoryItem> inventory; // Инвентарь игрока
+  int defense; // Показатель защиты игрока
+  int turnsInWater; // Количество ходов, проведенных в воде
+  Position? lastPositionInWater; // Последняя позиция, когда игрок был в воде
+
+  Player(Position position)
+      : inventory = <InventoryItem>[], // Инициализация инвентаря
+        defense = 0, // Инициализация защиты
+        turnsInWater = 0, // Инициализация ходов в воде
+        lastPositionInWater = null, // Инициализация последней позиции в воде
+        super(position, 100, 10, TileType.player.char, Colors.white);
+}
+
+/// Класс зомби
+class Zombie extends Actor {
+  Zombie(Position position)
+      : super(position, 30, 5, TileType.zombie.char, Colors.green);
+}
+
+/// Класс для представления одного достижения
+class Achievement {
+  final String id; // Уникальный идентификатор достижения
+  final String name;
+  final String description;
+  bool isUnlocked;
+
+  Achievement({
+    required this.id,
+    required this.name,
+    required this.description,
+    this.isUnlocked = false,
+  });
+}
+
+/// Класс для управления достижениями
+class GameAchievementsData extends ChangeNotifier {
+  final List<Achievement> _achievements = <Achievement>[];
+
+  // Внутренние флаги для отслеживания событий для достижений, которые должны сработать один раз
+  bool _firstGameStarted = false;
+  bool _firstZombieKilled = false;
+  bool _firstHealthPackUsed = false;
+  bool _firstKnifeUsed = false;
+  bool _firstItemCrafted = false;
+  bool _firstChestOpened = false;
+  bool _firstPistolKill = false;
+
+  GameAchievementsData() {
+    _achievements.addAll(<Achievement>[
+      Achievement(
+        id: 'first_game',
+        name: "Первый Запуск",
+        description: "Вы зашли в первый раз в игру.",
+      ),
+      Achievement(
+        id: 'first_zombie_kill',
+        name: "Первый Зомби",
+        description: "Первый зомби убит! Молодец.",
+      ),
+      Achievement(
+        id: 'first_health_pack_use',
+        name: "Первая Аптечка",
+        description: "Вы использовали аптечку, восстановив здоровье.",
+      ),
+      Achievement(
+        id: 'first_knife_use',
+        name: "Первый Нож",
+        description: "Вы использовали ваш первый нож в игре и увеличили урон.",
+      ),
+      Achievement(
+        id: 'first_craft',
+        name: "Первый Крафт",
+        description: "Вы впервые что-то скрафтили.",
+      ),
+      Achievement(
+        id: 'first_chest_opened',
+        name: "Первый Ящик",
+        description: "Вы открыли свой первый ящик.",
+      ),
+      Achievement(
+        id: 'first_pistol_kill',
+        name: "Первый Выстрел",
+        description: "Вы убили зомби из пистолета.",
+      ),
+    ]);
+  }
+
+  List<Achievement> get achievements => List<Achievement>.unmodifiable(_achievements);
+
+  void _unlockAchievement(String id) {
+    final Achievement? achievement = _achievements.firstWhereOrNull((Achievement a) => a.id == id);
+    if (achievement != null && !achievement.isUnlocked) {
+      achievement.isUnlocked = true;
+      notifyListeners();
+    }
+  }
+
+  void recordFirstGameStart() {
+    if (!_firstGameStarted) {
+      _firstGameStarted = true;
+      _unlockAchievement('first_game');
+    }
+  }
+
+  void recordFirstZombieKill() {
+    if (!_firstZombieKilled) {
+      _firstZombieKilled = true;
+      _unlockAchievement('first_zombie_kill');
+    }
+  }
+
+  void recordFirstHealthPackUse() {
+    if (!_firstHealthPackUsed) {
+      _firstHealthPackUsed = true;
+      _unlockAchievement('first_health_pack_use');
+    }
+  }
+
+  void recordFirstKnifeUse() {
+    if (!_firstKnifeUsed) {
+      _firstKnifeUsed = true;
+      _unlockAchievement('first_knife_use');
+    }
+  }
+
+  void recordFirstItemCrafted() {
+    if (!_firstItemCrafted) {
+      _firstItemCrafted = true;
+      _unlockAchievement('first_craft');
+    }
+  }
+
+  void recordFirstChestOpened() {
+    if (!_firstChestOpened) {
+      _firstChestOpened = true;
+      _unlockAchievement('first_chest_opened');
+    }
+  }
+
+  void recordFirstPistolKill() {
+    if (!_firstPistolKill) {
+      _firstPistolKill = true;
+      _unlockAchievement('first_pistol_kill');
+    }
+  }
+}
+
+/// Перечисление для выбора размера карты
+enum MapSizeOption {
+  small(16, "16x16 (Маленький)"),
+  medium(64, "64x64 (Средний)"),
+  large(128, "128x128 (Большой)"),
+  infinite(5000, "Бесконечный Мир (Процедурный)"); // Используем большое число для условного "конца"
+
+  final int size;
+  final String label;
+  const MapSizeOption(this.size, final String label) : label = label;
+}
+
+/// Класс для хранения настроек игры, изменяемых пользователем
+class GameOptionsData extends ChangeNotifier {
+  int _numberOfZombies;
+  int _numberOfHealthPacks;
+  int _numberOfKnives;
+  int _numberOfDefenseItems;
+  int _numberOfBushes;
+  int _numberOfChests;
+  int _numberOfTrees; // Новое поле для количества деревьев
+  int _numberOfBoulders; // НОВОЕ поле для количества валунов
+  MapSizeOption _mapSize;
+  bool _isFogOfWarEnabled;
+
+  GameOptionsData()
+      : _numberOfZombies = 5,
+        _numberOfHealthPacks = 3,
+        _numberOfKnives = 2,
+        _numberOfDefenseItems = 2,
+        _numberOfBushes = 10,
+        _numberOfChests = 5,
+        _numberOfTrees = 10, // Инициализация количества деревьев
+        _numberOfBoulders = 5, // НОВОЕ: Инициализация количества валунов
+        _mapSize = MapSizeOption.medium,
+        _isFogOfWarEnabled = true;
+
+  int get numberOfZombies => _numberOfZombies;
+  int get numberOfHealthPacks => _numberOfHealthPacks;
+  int get numberOfKnives => _numberOfKnives;
+  int get numberOfDefenseItems => _numberOfDefenseItems;
+  int get numberOfBushes => _numberOfBushes;
+  int get numberOfChests => _numberOfChests;
+  int get numberOfTrees => _numberOfTrees; // Геттер для количества деревьев
+  int get numberOfBoulders => _numberOfBoulders; // НОВЫЙ: Геттер для количества валунов
+  MapSizeOption get mapSize => _mapSize;
+  bool get isFogOfWarEnabled => _isFogOfWarEnabled;
+
+  set numberOfZombies(int value) {
+    if (_numberOfZombies != value) {
+      _numberOfZombies = value;
+      notifyListeners();
+    }
+  }
+
+  set numberOfHealthPacks(int value) {
+    if (_numberOfHealthPacks != value) {
+      _numberOfHealthPacks = value;
+      notifyListeners();
+    }
+  }
+
+  set numberOfKnives(int value) {
+    if (_numberOfKnives != value) {
+      _numberOfKnives = value;
+      notifyListeners();
+    }
+  }
+
+  set numberOfDefenseItems(int value) {
+    if (_numberOfDefenseItems != value) {
+      _numberOfDefenseItems = value;
+      notifyListeners();
+    }
+  }
+
+  set numberOfBushes(int value) {
+    if (_numberOfBushes != value) {
+      _numberOfBushes = value;
+      notifyListeners();
+    }
+  }
+
+  set numberOfChests(int value) {
+    if (_numberOfChests != value) {
+      _numberOfChests = value;
+      notifyListeners();
+    }
+  }
+
+  set numberOfTrees(int value) {
+    // Сеттер для количества деревьев
+    if (_numberOfTrees != value) {
+      _numberOfTrees = value;
+      notifyListeners();
+    }
+  }
+
+  set numberOfBoulders(int value) {
+    // НОВЫЙ: Сеттер для количества валунов
+    if (_numberOfBoulders != value) {
+      _numberOfBoulders = value;
+      notifyListeners();
+    }
+  }
+
+  set mapSize(MapSizeOption value) {
+    if (_mapSize != value) {
+      _mapSize = value;
+      notifyListeners();
+    }
+  }
+
+  set isFogOfWarEnabled(bool value) {
+    if (_isFogOfWarEnabled != value) {
+      _isFogOfWarEnabled = value;
+      notifyListeners();
+    }
+  }
+}
+
+/// New enum for game actions
+enum GameAction {
+  moveUp,
+  moveLeft,
+  moveDown,
+  moveRight,
+  toggleZoom,
+  openInventory,
+  openCrafting,
+  breakBush,
+  openChest,
+  chopTree,
+  shoot,
+  backToMainMenu,
+  breakBoulder, // НОВОЕ действие: Сломать валун
+}
+
+/// New class for managing game controls
+class GameControlsData extends ChangeNotifier {
+  Map<GameAction, LogicalKeyboardKey?> _keyBindings; // Changed to nullable
+  final List<String> _tutorialMessages; // New for storing tutorial messages
+
+  GameControlsData()
+      : _keyBindings = <GameAction, LogicalKeyboardKey?>{
+          GameAction.moveUp: LogicalKeyboardKey.keyW,
+          GameAction.moveLeft: LogicalKeyboardKey.keyA,
+          GameAction.moveDown: LogicalKeyboardKey.keyS,
+          GameAction.moveRight: LogicalKeyboardKey.keyD,
+          GameAction.toggleZoom: LogicalKeyboardKey.keyZ,
+          GameAction.openInventory: LogicalKeyboardKey.keyI,
+          GameAction.openCrafting: LogicalKeyboardKey.keyC,
+          GameAction.breakBush: LogicalKeyboardKey.keyR,
+          GameAction.openChest: LogicalKeyboardKey.keyE,
+          GameAction.chopTree: LogicalKeyboardKey.keyT,
+          GameAction.shoot: LogicalKeyboardKey.keyF,
+          GameAction.backToMainMenu: LogicalKeyboardKey.keyQ,
+          GameAction.breakBoulder: LogicalKeyboardKey.keyG, // НОВАЯ привязка клавиши
+        },
+        _tutorialMessages = <String>[
+          "Используйте WASD для движения.",
+          "Нажмите 'Z' для приближения/отдаления карты.",
+          "Нажмите 'I' для открытия инвентаря.",
+          "Нажмите 'C' для открытия меню крафта.",
+          "Нажмите 'R' чтобы сломать куст рядом (даст палки и листья).",
+          "Нажмите 'E' чтобы открыть ящик рядом (нужен лом).",
+          "Нажмите 'T' чтобы срубить дерево рядом (нужен топор).",
+          "Нажмите 'G' чтобы разбить валун рядом (нужен лом).", // НОВОЕ сообщение
+          "Нажмите 'F' чтобы выстрелить из пистолета (нужен пистолет и патроны).",
+          "Нажмите 'Q' для выхода в главное меню.",
+        ];
+
+  Map<GameAction, LogicalKeyboardKey?> get keyBindings => Map<GameAction, LogicalKeyboardKey?>.unmodifiable(_keyBindings);
+  List<String> get tutorialMessages => List<String>.unmodifiable(_tutorialMessages);
+
+  String getActionDescription(GameAction action) {
+    switch (action) {
+      case GameAction.moveUp:
+        return "Движение вверх";
+      case GameAction.moveLeft:
+        return "Движение влево";
+      case GameAction.moveDown:
+        return "Движение вниз";
+      case GameAction.moveRight:
+        return "Движение вправо";
+      case GameAction.toggleZoom:
+        return "Приближение/отдаление карты";
+      case GameAction.openInventory:
+        return "Открыть инвентарь";
+      case GameAction.openCrafting:
+        return "Открыть меню крафта";
+      case GameAction.breakBush:
+        return "Сломать куст";
+      case GameAction.openChest:
+        return "Открыть ящик";
+      case GameAction.chopTree:
+        return "Срубить дерево";
+      case GameAction.breakBoulder: // НОВОЕ описание
+        return "Разбить валун";
+      case GameAction.shoot:
+        return "Выстрелить";
+      case GameAction.backToMainMenu:
+        return "Выход в главное меню";
+    }
+  }
+
+  void updateKeyBinding(GameAction action, LogicalKeyboardKey? newKey) {
+    // Check if the new key is already assigned to another action
+    GameAction? conflictingAction;
+    for (MapEntry<GameAction, LogicalKeyboardKey?> entry in _keyBindings.entries) {
+      if (entry.value == newKey && entry.key != action) {
+        conflictingAction = entry.key;
+        break;
+      }
+    }
+
+    if (conflictingAction != null) {
+      // Swap keys: the conflicting action gets the key that was previously assigned to 'action'
+      final LogicalKeyboardKey? oldKeyOfTargetAction = _keyBindings[action];
+      _keyBindings[conflictingAction] = oldKeyOfTargetAction;
+    }
+    _keyBindings[action] = newKey; // Assign the new key to the target action
+    notifyListeners();
+  }
+}
+
+/// Класс для представления рецепта крафта
+class CraftingRecipe {
+  final ItemType craftedItemType;
+  final String craftedItemName;
+  final String craftedItemDescription; // For UI display
+  final Map<ItemType, int> requiredComponents;
+
+  CraftingRecipe({
+    required this.craftedItemType,
+    required this.craftedItemName,
+    required this.craftedItemDescription,
+    required this.requiredComponents,
+  });
+
+  // Helper to check if player has components
+  bool canCraft(Player player) {
+    for (MapEntry<ItemType, int> entry in requiredComponents.entries) {
+      final ItemType requiredType = entry.key;
+      final int requiredQuantity = entry.value;
+
+      // Special handling for durability items that don't stack
+      if (requiredType == ItemType.crowbar ||
+          requiredType == ItemType.improvedCrowbar ||
+          requiredType == ItemType.axe ||
+          requiredType == ItemType.stoneAxe) { // НОВОЕ: Каменный топор тоже не стакается
+        final int itemCount = player.inventory
+            .where((InventoryItem i) => i.itemType == requiredType && (i.currentDurability ?? 0) > 0)
+            .length;
+        if (itemCount < requiredQuantity) {
+          return false;
+        }
+      } else {
+        // For stackable items
+        final InventoryItem? playerItem = player.inventory.firstWhereOrNull(
+            (InventoryItem i) => i.itemType == requiredType);
+        if (playerItem == null || playerItem.quantity < requiredQuantity) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+}
+
+// Список всех доступных рецептов крафта
+final List<CraftingRecipe> allCraftingRecipes = <CraftingRecipe>[
+  CraftingRecipe(
+    craftedItemType: ItemType.sharpLongStick,
+    craftedItemName: "Острая длинная палка",
+    craftedItemDescription: "Острая длинная палка, обмотанная листьями. Увеличивает урон на 20.",
+    requiredComponents: <ItemType, int>{
+      ItemType.sticks: 1,
+      ItemType.leaves: 2,
+    },
+  ),
+  CraftingRecipe(
+    craftedItemType: ItemType.longKnife,
+    craftedItemName: "Длинный нож",
+    craftedItemDescription: "Удлиненный нож. Увеличивает урон на 30.",
+    requiredComponents: <ItemType, int>{
+      ItemType.knife: 1,
+      ItemType.sticks: 1,
+    },
+  ),
+  CraftingRecipe(
+    craftedItemType: ItemType.primitiveBandage,
+    craftedItemName: "Примитивный бинт",
+    craftedItemDescription: "Простой бинт из листьев. Восстанавливает 10 здоровья.",
+    requiredComponents: <ItemType, int>{
+      ItemType.leaves: 3,
+    },
+  ),
+  CraftingRecipe(
+    craftedItemType: ItemType.leafArmor,
+    craftedItemName: "Броня из листьев",
+    craftedItemDescription: "Легкая броня из листьев. Увеличивает защиту на 2.",
+    requiredComponents: <ItemType, int>{
+      ItemType.leaves: 5,
+    },
+  ),
+  CraftingRecipe( // Рецепт: Лом
+    craftedItemType: ItemType.crowbar,
+    craftedItemName: "Лом",
+    craftedItemDescription: "Прочный лом, который поможет открыть запертые ящики.",
+    requiredComponents: <ItemType, int>{
+      ItemType.sticks: 3,
+    },
+  ),
+  CraftingRecipe( // Новый рецепт: Улучшенный лом
+    craftedItemType: ItemType.improvedCrowbar,
+    craftedItemName: "Улучшенный лом",
+    craftedItemDescription: "Очень прочный лом, открывает до 5 ящиков.",
+    requiredComponents: <ItemType, int>{
+      ItemType.crowbar: 1, // Требует 1 лом
+      ItemType.log: 1, // Требует 1 бревно
+    },
+  ),
+  CraftingRecipe( // Новый рецепт: Деревянный щит
+    craftedItemType: ItemType.woodenShield,
+    craftedItemName: "Деревянный щит",
+    craftedItemDescription: "Примитивный щит. Увеличивает защиту на 5.",
+    requiredComponents: <ItemType, int>{
+      ItemType.log: 1, // Требует 1 бревно
+      ItemType.leaves: 2, // Требует 2 листа
+    },
+  ),
+  CraftingRecipe( // НОВЫЙ рецепт: Каменный топор
+    craftedItemType: ItemType.stoneAxe,
+    craftedItemName: "Каменный топор",
+    craftedItemDescription: "Примитивный топор. Срубает 1 дерево.",
+    requiredComponents: <ItemType, int>{
+      ItemType.stones: 1, // Требует 1 камень
+      ItemType.sticks: 1, // Требует 1 палку
+    },
+  ),
+];
+
+/// Класс для хранения всего состояния игры
+class GameState {
+  List<List<TileType>>? _fixedMap; // For small and medium maps
+  Player player;
+  List<Zombie> zombies;
+  List<Position> healthPacks;
+  List<Position> knives;
+  List<Position> defenseItems;
+  List<Position> chests;
+  List<Position> boulders; // НОВОЕ: список валунов для фиксированных карт
+  List<String> messageLog;
+  Map<Position, bool> _exploredTiles; // Changed to Map for infinite maps
+  Map<Position, TileType> _overriddenTiles; // NEW: For dynamically changing Perlin/fixed terrain
+  int turns;
+  bool isGameOver;
+  final Random _random;
+  final int _perlinSeed; // New field to store Perlin noise seed
+
+  // Perlin noise parameters for map generation (adjusted to fit boulders)
+  static const double _noiseScale = 0.05; // Adjust for feature size
+  static const double _waterThreshold = 0.25; // Noise value for water
+  static const double _bushThreshold = 0.40; // Noise value for bush
+  static const double _treeThreshold = 0.55; // Noise value for tree
+  static const double _boulderThreshold = 0.65; // НОВОЕ: Noise value for boulder
+  static const double _wallThreshold = 0.75; // Adjusted noise value for wall
+
+  final int initialZombies;
+  final int initialHealthPacks;
+  final int initialKnives;
+  final int initialDefenseItems;
+  final int initialBushes; // Still used for initial terrain placement on fixed maps
+  final int initialChests;
+  final int initialTrees; // Still used for initial terrain placement on fixed maps
+  final int initialBoulders; // НОВОЕ: для валунов
+  final int mapWidth;
+  final int mapHeight;
+  final MapSizeOption selectedMapSizeOption; // Keep track of the selected map size option
+
+  GameState({
+    this.initialZombies = 5,
+    this.initialHealthPacks = 3,
+    this.initialKnives = 2,
+    this.initialDefenseItems = 2,
+    this.initialBushes = 10,
+    this.initialChests = 5,
+    this.initialTrees = 10, // Инициализация
+    this.initialBoulders = 5, // НОВОЕ: Инициализация
+    required this.mapWidth,
+    required this.mapHeight,
+    required this.selectedMapSizeOption,
+  })  : _random = Random(),
+        _perlinSeed = Random().nextInt(1000000), // Generate a seed for Perlin noise
+        player = Player(Position(0, 0)),
+        zombies = <Zombie>[],
+        healthPacks = <Position>[],
+        knives = <Position>[],
+        defenseItems = <Position>[],
+        chests = <Position>[],
+        boulders = <Position>[], // НОВОЕ: Инициализация списка валунов
+        messageLog = <String>[],
+        _exploredTiles = <Position, bool>{},
+        _overriddenTiles = <Position, TileType>{},
+        turns = 0,
+        isGameOver = false {
+    _initializePerlinNoise(_perlinSeed); // Initialize Perlin noise with seed
+    _generateMap(); // This will now conditionally generate
+    _placeEntities();
+    addMessage("Добро пожаловать в зомби-апокалипсис!");
+    addMessage("Для помощи и настроек управления, посетите раздел 'Управление' в главном меню.");
+  }
+
+  /// Retrieves the tile type at a given position, generating it on the fly for large/infinite maps.
+  /// Also checks for overridden tiles (e.g., broken bushes/chopped trees).
+  TileType _getTileTypeAt(int x, int y) {
+    Position currentPos = Position(x, y);
+    // NEW: First, check for an explicit override
+    if (_overriddenTiles.containsKey(currentPos)) {
+      return _overriddenTiles[currentPos]!;
+    }
+
+    // Ensure coordinates are within map bounds for non-infinite maps
+    if (selectedMapSizeOption != MapSizeOption.infinite &&
+        (x < 0 || x >= mapWidth || y < 0 || y >= mapHeight)) {
+      return TileType.wall; // Treat out-of-bounds as wall for fixed maps
+    }
+
+    // Check if it's a fixed map (small or medium)
+    if (_fixedMap != null) {
+      // For fixed maps, we still need to check dynamic entities (like boulders, chests)
+      // that might be overriding base terrain
+      if (boulders.any((Position b) => b.x == x && b.y == y)) {
+        return TileType.boulder;
+      }
+      return _fixedMap![y][x];
+    }
+
+    // Otherwise, generate using Perlin noise
+    double noiseValue = _perlinNoise(x * _noiseScale, y * _noiseScale, octaves: 4, persistence: 0.5);
+
+    TileType baseTile;
+    if (noiseValue > _wallThreshold) {
+      baseTile = TileType.wall;
+    } else if (noiseValue > _boulderThreshold) { // НОВОЕ: Валуны
+      baseTile = TileType.boulder;
+    } else if (noiseValue > _treeThreshold) {
+      baseTile = TileType.tree;
+    } else if (noiseValue > _bushThreshold) {
+      baseTile = TileType.bush;
+    } else if (noiseValue > _waterThreshold) {
+      baseTile = TileType.water;
+    } else {
+      baseTile = TileType.empty;
+    }
+
+    // Enforce spacing for bushes, trees, and boulders on Perlin maps
+    if ((baseTile == TileType.bush || baseTile == TileType.tree || baseTile == TileType.boulder)) {
+      bool conflictingNeighbor = false;
+      for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+          if (dx == 0 && dy == 0) continue; // Skip self
+
+          int nx = x + dx;
+          int ny = y + dy;
+
+          // For infinite map, we compare current tile's potential against neighbor's potential.
+          if (selectedMapSizeOption == MapSizeOption.large ||
+              selectedMapSizeOption == MapSizeOption.infinite) {
+            double neighborNoiseValue = _perlinNoise(nx * _noiseScale, ny * _noiseScale, octaves: 4, persistence: 0.5);
+            TileType neighborPotentialTile;
+
+            if (neighborNoiseValue > _wallThreshold) {
+              neighborPotentialTile = TileType.wall;
+            } else if (neighborNoiseValue > _boulderThreshold) {
+              neighborPotentialTile = TileType.boulder;
+            } else if (neighborNoiseValue > _treeThreshold) {
+              neighborPotentialTile = TileType.tree;
+            } else if (neighborNoiseValue > _bushThreshold) {
+              neighborPotentialTile = TileType.bush;
+            } else if (neighborNoiseValue > _waterThreshold) {
+              neighborPotentialTile = TileType.water;
+            } else {
+              neighborPotentialTile = TileType.empty;
+            }
+
+            // If neighbor also wants to be a bush, tree, or boulder, resolve the conflict.
+            // A simple rule: if my noise value is lower (closer to empty/water), I yield.
+            if ((neighborPotentialTile == TileType.bush ||
+                 neighborPotentialTile == TileType.tree ||
+                 neighborPotentialTile == TileType.boulder)) {
+              if (noiseValue < neighborNoiseValue) {
+                conflictingNeighbor = true;
+                break;
+              }
+            }
+          }
+        }
+        if (conflictingNeighbor) break;
+      }
+      if (conflictingNeighbor) {
+        return TileType.empty;
+      }
+    }
+
+    return baseTile;
+  }
+
+  /// Генерирует карту с пустыми пространствами и случайными стенами (для small/medium)
+  /// или инициализирует для Perlin noise (для large/infinite)
+  void _generateMap() {
+    if (selectedMapSizeOption == MapSizeOption.small ||
+        selectedMapSizeOption == MapSizeOption.medium) {
+      // Old map generation for small and medium sizes
+      _fixedMap = List<List<TileType>>.generate(
+          mapHeight, (_) => List<TileType>.filled(mapWidth, TileType.empty));
+
+      // Place random walls, ensuring spacing
+      for (int i = 0; i < (mapWidth * mapHeight) ~/ 20; i++) {
+        Position wallPos;
+        int attempts = 0;
+        do {
+          wallPos = Position(_random.nextInt(mapWidth), _random.nextInt(mapHeight));
+          attempts++;
+          if (attempts > 1000) break; // Avoid infinite loop on very dense maps
+        } while (!_isAreaClearForBlockingEntity(wallPos.x, wallPos.y, TileType.wall, null));
+        _fixedMap![wallPos.y][wallPos.x] = TileType.wall;
+      }
+
+      // NEW: Place random bushes as terrain features for fixed maps
+      for (int i = 0; i < initialBushes; i++) {
+        Position bushPos;
+        int attempts = 0;
+        do {
+          bushPos = Position(_random.nextInt(mapWidth), _random.nextInt(mapHeight));
+          attempts++;
+          if (attempts > 1000) break; // Avoid infinite loop
+        } while (!_isAreaClearForBlockingEntity(bushPos.x, bushPos.y, TileType.bush, null));
+        _fixedMap![bushPos.y][bushPos.x] = TileType.bush;
+      }
+
+      // NEW: Place random trees as terrain features for fixed maps
+      for (int i = 0; i < initialTrees; i++) {
+        Position treePos;
+        int attempts = 0;
+        do {
+          treePos = Position(_random.nextInt(mapWidth), _random.nextInt(mapHeight));
+          attempts++;
+          if (attempts > 1000) break; // Avoid infinite loop
+        } while (!_isAreaClearForBlockingEntity(treePos.x, treePos.y, TileType.tree, null));
+        _fixedMap![treePos.y][treePos.x] = TileType.tree;
+      }
+
+      // НОВОЕ: Place random boulders as terrain features for fixed maps
+      for (int i = 0; i < initialBoulders; i++) {
+        Position boulderPos;
+        int attempts = 0;
+        do {
+          boulderPos = Position(_random.nextInt(mapWidth), _random.nextInt(mapHeight));
+          attempts++;
+          if (attempts > 1000) break; // Avoid infinite loop
+        } while (!_isAreaClearForBlockingEntity(boulderPos.x, boulderPos.y, TileType.boulder, null));
+        _fixedMap![boulderPos.y][boulderPos.x] = TileType.boulder;
+      }
+    } else {
+      // For large and infinite maps, the map is generated on demand with Perlin noise.
+      // No need to pre-fill _fixedMap, it will remain null.
+    }
+  }
+
+  /// Checks if a 3x3 area around (x,y) is clear of blocking entities or terrain types
+  bool _isAreaClearForBlockingEntity(int x, int y, TileType typeToPlace, Position? currentPlayerPos) {
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        int nx = x + dx;
+        int ny = y + dy;
+
+        // Check bounds (conceptual for infinite maps, strict for fixed)
+        if (selectedMapSizeOption != MapSizeOption.infinite &&
+            (nx < 0 || nx >= mapWidth || ny < 0 || ny >= mapHeight)) {
+          return false; // Out of bounds is blocking
+        }
+
+        // Get tile type, using the unified method (accounts for _fixedMap and Perlin)
+        TileType existingTile = _getTileTypeAt(nx, ny);
+
+        // Blocking terrain types (walls, bushes, trees, water, boulders - water is considered blocking for placement)
+        if (existingTile == TileType.wall ||
+            existingTile == TileType.bush ||
+            existingTile == TileType.tree ||
+            existingTile == TileType.water ||
+            existingTile == TileType.boulder) { // НОВОЕ: Валун тоже блокирует
+          return false;
+        }
+
+        // Check if other entities (chests, actors) are blocking
+        if (chests.any((Position c) => c.x == nx && c.y == ny)) return false;
+        if (boulders.any((Position b) => b.x == nx && b.y == ny)) return false; // НОВОЕ: Валун тоже блокирует
+
+        // Ensure player is not blocked by initial placements
+        if (currentPlayerPos != null && currentPlayerPos.x == nx && currentPlayerPos.y == ny) return false;
+        if (player.position.x == nx && player.position.y == ny) return false; // Check against player's final position
+
+        // Check if other zombies are blocking
+        if (zombies.any((Zombie z) => z.position.x == nx && z.position.y == ny)) return false;
+      }
+    }
+    return true;
+  }
+
+  /// Размещает игрока, зомби, аптечки, ножи, предметы защиты и ящики на карте.
+  /// Кусты, деревья и валуны теперь размещаются как часть ландшафта в _generateMap.
+  void _placeEntities() {
+    // Размещаем игрока
+    Position playerPos = _getRandomSpawnPosition();
+    player.position = playerPos;
+
+    // Размещаем зомби
+    for (int i = 0; i < initialZombies; i++) {
+      Position zombiePos = _getRandomSpawnPosition();
+      zombies.add(Zombie(zombiePos));
+    }
+
+    // Размещаем аптечки
+    for (int i = 0; i < initialHealthPacks; i++) {
+      Position hpPos = _getRandomSpawnPosition();
+      healthPacks.add(hpPos);
+    }
+
+    // Размещаем ножи
+    for (int i = 0; i < initialKnives; i++) {
+      Position knifePos = _getRandomSpawnPosition();
+      knives.add(knifePos);
+    }
+
+    // Размещаем предметы защиты
+    for (int i = 0; i < initialDefenseItems; i++) {
+      Position defensePos = _getRandomSpawnPosition();
+      defenseItems.add(defensePos);
+    }
+
+    // Removed placement for bushes and trees here; they are now part of terrain generation.
+
+    // Размещаем ящики (always random, as they are not terrain features)
+    for (int i = 0; i < initialChests; i++) {
+      Position chestPos;
+      int attempts = 0;
+      do {
+        chestPos = _getRandomSpawnPosition();
+        attempts++;
+        if (attempts > 1000) break; // Avoid infinite loop
+      } while (!_isAreaClearForBlockingEntity(chestPos.x, chestPos.y, TileType.chest, null)); // Chests are not part of terrain but block entities.
+      chests.add(chestPos);
+    }
+
+    // НОВОЕ: Размещаем валуны для фиксированных карт
+    if (selectedMapSizeOption == MapSizeOption.small || selectedMapSizeOption == MapSizeOption.medium) {
+      for (int i = 0; i < initialBoulders; i++) {
+        Position boulderPos;
+        int attempts = 0;
+        do {
+          boulderPos = _getRandomSpawnPosition();
+          attempts++;
+          if (attempts > 1000) break;
+        } while (!_isAreaClearForBlockingEntity(boulderPos.x, boulderPos.y, TileType.boulder, null));
+        boulders.add(boulderPos);
+      }
+    }
+  }
+
+  /// Находит случайную пустую позицию, не занятую блокирующим ландшафтом или другими сущностями,
+  /// и где зона 3х3 вокруг этой позиции не занята другими блокирующими сущностями.
+  Position _getRandomSpawnPosition() {
+    Position pos;
+    int attemptCount = 0;
+    const int maxAttempts = 5000; // Increased attempts for complex placement
+
+    do {
+      pos = Position(_random.nextInt(mapWidth), _random.nextInt(mapHeight));
+      attemptCount++;
+      if (attemptCount > maxAttempts) {
+        print("Warning: Max attempts reached for _getRandomSpawnPosition. Placing in potentially non-ideal spot.");
+        break;
+      }
+      // _isAreaClearForBlockingEntity checks for walls/bushes/trees/chests/actors/boulders in a 3x3 area.
+      // _isTerrainWalkable checks if the specific spot itself is walkable (considering terrain).
+    } while (!_isTerrainWalkable(pos.x, pos.y) || _isOccupiedByEntity(pos) || !_isAreaClearForBlockingEntity(pos.x, pos.y, TileType.empty, null));
+    return pos;
+  }
+
+  /// Проверяет, занята ли позиция каким-либо игровым объектом (entities that block initial placement)
+  /// Это относится только к динамически размещаемым объектам, не к ландшафту.
+  bool _isOccupiedByEntity(Position pos) {
+    return (pos == player.position) ||
+        zombies.any((Zombie z) => z.position == pos) ||
+        healthPacks.any((Position hp) => hp == pos) ||
+        knives.any((Position k) => k == pos) ||
+        defenseItems.any((Position d) => d == pos) ||
+        chests.any((Position c) => c == pos) ||
+        boulders.any((Position b) => b == pos); // НОВОЕ: Учитываем валуны
+  }
+
+
+  /// Проверяет, является ли позиция проходимой по ландшафту и статическим объектам.
+  /// Акторов (игрока, зомби) не учитывает, так как на их позицию можно наступить для боя.
+  bool _isTerrainWalkable(int x, int y) {
+    // Boundary check for fixed maps
+    if (selectedMapSizeOption != MapSizeOption.infinite &&
+        (x < 0 || x >= mapWidth || y < 0 || y >= mapHeight)) {
+      return false;
+    }
+
+    // Get base tile type from generation logic (fixed map or Perlin, including overrides)
+    TileType baseTile = _getTileTypeAt(x, y);
+
+    // Check if base tile itself blocks movement (walls, bushes, trees, boulders)
+    if (baseTile == TileType.wall ||
+        baseTile == TileType.bush || // Bushes now block movement
+        baseTile == TileType.tree || // Trees now block movement
+        baseTile == TileType.boulder) { // НОВОЕ: Валуны тоже блокируют движение
+      return false;
+    }
+
+    // Chests always block movement (they are not actors)
+    if (chests.any((Position c) => c.x == x && c.y == y)) return false;
+
+    // Water is traversable terrain, but can cause damage
+    // Other items are also traversable, but a zombie should avoid them (handled in _zombieTurn)
+
+    return true;
+  }
+
+  /// Возвращает актора по заданной позиции, если есть
+  Actor? getActorAt(int x, int y) {
+    if (player.position.x == x && player.position.y == y) return player;
+    for (var zombie in zombies) {
+      if (zombie.position.x == x && zombie.position.y == y) return zombie;
+    }
+    return null;
+  }
+
+  /// Добавляет сообщение в лог сообщений
+  void addMessage(String message) {
+    messageLog.insert(0, message); // Добавляем в начало списка
+    if (messageLog.length > MAX_MESSAGE_LOG) {
+      messageLog = messageLog.sublist(0, MAX_MESSAGE_LOG);
+    }
+  }
+
+  /// Проверяет, находится ли игрок в поле зрения зомби (8x8 квадрат)
+  bool isPlayerInZombieVision(Zombie zombie) {
+    int playerX = player.position.x;
+    int playerY = player.position.y;
+    int zombieX = zombie.position.x;
+    int zombieY = zombie.position.y;
+
+    return (playerX - zombieX).abs() <= ZOMBIE_VISION_RANGE &&
+        (playerY - zombieY).abs() <= ZOMBIE_VISION_RANGE;
+  }
+
+  /// Находит ближайшего зомби в радиусе действия
+  Zombie? findNearestZombieInRange(Position center, int range) {
+    Zombie? nearestZombie;
+    int minDistanceSquared = range * range + 1; // Больше, чем максимальный квадрат дальности
+
+    for (var zombie in zombies) {
+      if (!zombie.isAlive()) continue;
+
+      int dx = zombie.position.x - center.x;
+      int dy = zombie.position.y - center.y;
+      int distanceSquared = dx * dx + dy * dy;
+
+      if (distanceSquared <= range * range && distanceSquared < minDistanceSquared) {
+        nearestZombie = zombie;
+        minDistanceSquared = distanceSquared;
+      }
+    }
+    return nearestZombie;
+  }
+
+  /// Проверяет, был ли тайл исследован
+  bool isTileExplored(int x, int y) {
+    return _exploredTiles[Position(x, y)] ?? false;
+  }
+
+  /// Обновляет исследованные тайлы вокруг игрока
+  void updateExploredTiles() {
+    int playerX = player.position.x;
+    int playerY = player.position.y;
+
+    for (int y = playerY - FOG_OF_WAR_VISION_RADIUS;
+        y <= playerY + FOG_OF_WAR_VISION_RADIUS;
+        y++) {
+      for (int x = playerX - FOG_OF_WAR_VISION_RADIUS;
+          x <= playerX + FOG_OF_WAR_VISION_RADIUS;
+          x++) {
+        // No strict map boundary check here, as _exploredTiles is a map for infinite worlds.
+        // The `_getTileTypeAt` will handle conceptual boundaries for non-infinite maps.
+        int dx = x - playerX;
+        int dy = y - playerY;
+        if (dx * dx + dy * dy <= FOG_OF_WAR_VISION_RADIUS * FOG_OF_WAR_VISION_RADIUS) {
+          _exploredTiles[Position(x, y)] = true;
+        }
+      }
+    }
+  }
+}
+
+// --- Custom Painter для отрисовки карты ---
+
+/// Класс для отрисовки игровой карты с помощью CustomPainter
+class GameMapPainter extends CustomPainter {
+  final GameState gameState;
+  final bool isZoomedToPlayer;
+  final int playerX;
+  final int playerY;
+  final bool isFogOfWarEnabled;
+  final MapSizeOption selectedMapSizeOption;
+
+  GameMapPainter(this.gameState, this.isZoomedToPlayer, this.playerX, this.playerY,
+      {required this.isFogOfWarEnabled, required this.selectedMapSizeOption});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final TextPainter textPainter = TextPainter(
+      textDirection: TextDirection.ltr,
+    );
+
+    final int currentMapWidth = gameState.mapWidth;
+    final int currentMapHeight = gameState.mapHeight;
+
+    final int renderWindowDesiredSize = isZoomedToPlayer ? ZOOM_VIEW_SIZE : WIDE_VIEW_SIZE;
+
+    int effectiveViewWidth = renderWindowDesiredSize;
+    int effectiveViewHeight = renderWindowDesiredSize;
+
+    if (gameState.selectedMapSizeOption != MapSizeOption.infinite) {
+      effectiveViewWidth = min(renderWindowDesiredSize, currentMapWidth);
+      effectiveViewHeight = min(renderWindowDesiredSize, currentMapHeight);
+    }
+
+    int halfEffectiveViewWidth = (effectiveViewWidth - 1) ~/ 2;
+    int halfEffectiveViewHeight = (effectiveViewHeight - 1) ~/ 2;
+
+    int startX, startY, endX, endY;
+
+    if (gameState.selectedMapSizeOption != MapSizeOption.infinite) {
+      // For fixed maps, center view around player, then clamp within map bounds.
+      startX = (playerX - halfEffectiveViewWidth).clamp(0, currentMapWidth - effectiveViewWidth).toInt();
+      startY = (playerY - halfEffectiveViewHeight).clamp(0, currentMapHeight - effectiveViewHeight).toInt();
+      endX = startX + effectiveViewWidth;
+      endY = startY + effectiveViewHeight;
+    } else {
+      // For infinite map, view is always player-centered at the desired size.
+      startX = playerX - halfEffectiveViewWidth;
+      startY = playerY - halfEffectiveViewHeight;
+      endX = playerX + halfEffectiveViewWidth + 1;
+      endY = playerY + halfEffectiveViewHeight + 1;
+    }
+
+    for (int y = startY; y < endY; y++) {
+      for (int x = startX; x < endX; x++) {
+        String charToDraw = ' ';
+        Color colorToDraw = Colors.black;
+
+        bool isInVision = true;
+        if (isFogOfWarEnabled) {
+          int dx = x - playerX;
+          int dy = y - playerY;
+          isInVision = (dx * dx + dy * dy <= FOG_OF_WAR_VISION_RADIUS * FOG_OF_WAR_VISION_RADIUS);
+        }
+
+        bool tileWasExplored = gameState.isTileExplored(x, y);
+
+        if (isFogOfWarEnabled && !isInVision && !tileWasExplored) {
+          charToDraw = ' ';
+          colorToDraw = Colors.black;
+        } else {
+          // Get the base tile type (from fixed map or Perlin noise, INCLUDING OVERRIDES)
+          TileType baseTile = gameState._getTileTypeAt(x, y);
+          charToDraw = baseTile.char;
+          colorToDraw = Colors.grey[800]!; // Default for empty/unknown terrain
+
+          if (baseTile == TileType.wall) {
+            colorToDraw = Colors.grey;
+          } else if (baseTile == TileType.bush) {
+            colorToDraw = Colors.green[700]!;
+          } else if (baseTile == TileType.tree) {
+            colorToDraw = Colors.brown[700]!;
+          } else if (baseTile == TileType.water) { // New: Water color
+            colorToDraw = Colors.blue[800]!;
+          } else if (baseTile == TileType.boulder) { // НОВОЕ: Валун
+            charToDraw = TileType.boulder.char;
+            colorToDraw = Colors.grey[600]!;
+          } else if (baseTile == TileType.empty) { // Ensure empty tiles have a default background color
+             colorToDraw = Colors.grey[800]!;
+          }
+
+          // Removed old logic for overlaying bushes and trees as separate entities for small/medium maps.
+          // _getTileTypeAt is now the single source of truth for these terrain features.
+
+          // Overlay items and chests (always separate entities)
+          if (gameState.healthPacks.any((Position hp) => hp.x == x && hp.y == y)) {
+            charToDraw = TileType.healthPack.char;
+            colorToDraw = Colors.red;
+          }
+          if (gameState.knives.any((Position knife) => knife.x == x && knife.y == y)) {
+            charToDraw = TileType.knife.char;
+            colorToDraw = Colors.blueGrey;
+          }
+          if (gameState.defenseItems.any((Position defense) => defense.x == x && defense.y == y)) {
+            charToDraw = TileType.defenseItem.char;
+            colorToDraw = Colors.purple;
+          }
+          if (gameState.chests.any((Position chest) => chest.x == x && chest.y == y)) {
+            charToDraw = TileType.chest.char;
+            colorToDraw = Colors.orange[700]!;
+          }
+
+          // Overlay actors
+          Actor? actor = gameState.getActorAt(x, y);
+          if (actor != null) {
+            charToDraw = actor.char;
+            colorToDraw = actor.color;
+          }
+
+          // If fog of war is enabled and tile is explored but out of current vision, dim it
+          if (isFogOfWarEnabled && !isInVision && tileWasExplored) {
+            colorToDraw = colorToDraw.withOpacity(0.3);
+          }
+        }
+
+        textPainter.text = TextSpan(
+          text: charToDraw,
+          style: TextStyle(
+            color: colorToDraw,
+            fontSize: TILE_SIZE,
+            fontFamily: FONT_FAMILY,
+          ),
+        );
+        textPainter.layout();
+        // Adjust paint offset based on current view window
+        textPainter.paint(canvas, Offset((x - startX) * TILE_SIZE, (y - startY) * TILE_SIZE));
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant GameMapPainter oldDelegate) {
+    // Rely on changes to player position, zoom, fog of war, and map size option.
+    // Entity lists also cause repaint.
+    // Also explicitly check _overriddenTiles length as it signifies changes to terrain.
+    return gameState.player.position != oldDelegate.gameState.player.position ||
+           isZoomedToPlayer != oldDelegate.isZoomedToPlayer ||
+           playerX != oldDelegate.playerX ||
+           playerY != oldDelegate.playerY ||
+           isFogOfWarEnabled != oldDelegate.isFogOfWarEnabled ||
+           selectedMapSizeOption != oldDelegate.selectedMapSizeOption ||
+           gameState.zombies.length != oldDelegate.gameState.zombies.length ||
+           gameState.healthPacks.length != oldDelegate.gameState.healthPacks.length ||
+           gameState.knives.length != oldDelegate.gameState.knives.length ||
+           gameState.defenseItems.length != oldDelegate.gameState.defenseItems.length ||
+           gameState.chests.length != oldDelegate.gameState.chests.length ||
+           gameState.boulders.length != oldDelegate.gameState.boulders.length || // НОВОЕ: Проверка валунов
+           gameState._overriddenTiles.length != oldDelegate.gameState._overriddenTiles.length;
+  }
+}
+
+// Расширение для удобного использования firstWhereOrNull
+extension IterableExtension<T> on Iterable<T> {
+  T? firstWhereOrNull(bool Function(T element) test) {
+    for (var element in this) {
+      if (test(element)) {
+        return element;
+      }
+    }
+    return null;
+  }
+}
+
+/// Перечисление для управления текущим экраном приложения
+enum AppScreen {
+  mainMenu,
+  game,
+  gameOptions,
+  inventory,
+  achievements,
+  crafting,
+  controls,
+}
+
+/// Виджет главного меню
+class MainMenuWidget extends StatelessWidget {
+  final VoidCallback onNewGame;
+  final VoidCallback onExit;
+  final VoidCallback onGameOptions;
+  final VoidCallback onAchievements;
+  final VoidCallback onControls;
+
+  const MainMenuWidget({
+    Key? key,
+    required this.onNewGame,
+    required this.onExit,
+    required this.onGameOptions,
+    required this.onAchievements,
+    required this.onControls,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: <Widget>[
+          const Text(
+            "Zombie Roguelike",
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 48,
+              fontWeight: FontWeight.bold,
+              fontFamily: FONT_FAMILY,
+            ),
+          ),
+          const SizedBox(height: 50),
+          SizedBox(
+            width: 200,
+            child: ElevatedButton(
+              onPressed: onNewGame,
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                backgroundColor: Colors.redAccent,
+                textStyle: const TextStyle(fontSize: 20, color: Colors.white),
+              ),
+              child: const Text("Новая игра"),
+            ),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: 200,
+            child: ElevatedButton(
+              onPressed: onGameOptions,
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                backgroundColor: Colors.blueAccent,
+                textStyle: const TextStyle(fontSize: 20, color: Colors.white),
+              ),
+              child: const Text("Настройки Игры"),
+            ),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: 200,
+            child: ElevatedButton(
+              onPressed: onControls,
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                backgroundColor: Colors.teal, // New color for controls
+                textStyle: const TextStyle(fontSize: 20, color: Colors.white),
+              ),
+              child: const Text("Управление"),
+            ),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: 200,
+            child: ElevatedButton(
+              onPressed: onAchievements,
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                backgroundColor: Colors.green,
+                textStyle: const TextStyle(fontSize: 20, color: Colors.white),
+              ),
+              child: const Text("Достижения"),
+            ),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: 200,
+            child: ElevatedButton(
+              onPressed: onExit,
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                backgroundColor: Colors.grey[700],
+                textStyle: const TextStyle(fontSize: 20, color: Colors.white),
+              ),
+              child: const Text("Выход"),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Виджет для экрана настроек игры
+class GameOptionsWidget extends StatelessWidget {
+  final VoidCallback onBackToMainMenu;
+
+  const GameOptionsWidget({
+    Key? key,
+    required this.onBackToMainMenu,
+  }) : super(key: key);
+
+  Widget _buildOptionSlider(
+    BuildContext context, {
+    required String label,
+    required int currentValue,
+    required int min,
+    required int max,
+    required int divisions,
+    required ValueChanged<int> onChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10.0),
+      child: Column(
+        children: <Widget>[
+          Text(
+            "$label $currentValue",
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontFamily: FONT_FAMILY,
+            ),
+          ),
+          Slider(
+            value: currentValue.toDouble(),
+            min: min.toDouble(),
+            max: max.toDouble(),
+            divisions: divisions,
+            label: currentValue.toString(),
+            onChanged: (double value) => onChanged(value.toInt()),
+            activeColor: Colors.redAccent,
+            inactiveColor: Colors.grey,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMapSizeSelector(
+    BuildContext context, {
+    required String label,
+    required MapSizeOption currentValue,
+    required ValueChanged<MapSizeOption?> onChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10.0),
+      child: Column(
+        children: <Widget>[
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontFamily: FONT_FAMILY,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.grey[800],
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.white54),
+            ),
+            child: DropdownButton<MapSizeOption>(
+              value: currentValue,
+              dropdownColor: Colors.grey[800],
+              icon: const Icon(Icons.arrow_downward, color: Colors.white),
+              underline: Container(), // Remove underline
+              onChanged: onChanged,
+              items: MapSizeOption.values
+                  .map<DropdownMenuItem<MapSizeOption>>((MapSizeOption value) {
+                return DropdownMenuItem<MapSizeOption>(
+                  value: value,
+                  child: Text(
+                    value.label,
+                    style: const TextStyle(color: Colors.white, fontSize: 16, fontFamily: FONT_FAMILY),
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16.0),
+          child: Consumer<GameOptionsData>(
+            builder: (BuildContext context, GameOptionsData gameOptions, Widget? child) {
+              return Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: <Widget>[
+                  const Text(
+                    "Настройки",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 36,
+                      fontWeight: FontWeight.bold,
+                      fontFamily: FONT_FAMILY,
+                    ),
+                  ),
+                  const SizedBox(height: 40),
+                  _buildOptionSlider(
+                    context,
+                    label: "Количество Зомби:",
+                    currentValue: gameOptions.numberOfZombies,
+                    min: 1,
+                    max: 20,
+                    divisions: 19,
+                    onChanged: (int value) => gameOptions.numberOfZombies = value,
+                  ),
+                  _buildOptionSlider(
+                    context,
+                    label: "Количество Аптечек:",
+                    currentValue: gameOptions.numberOfHealthPacks,
+                    min: 0,
+                    max: 10,
+                    divisions: 10,
+                    onChanged: (int value) => gameOptions.numberOfHealthPacks = value,
+                  ),
+                  _buildOptionSlider(
+                    context,
+                    label: "Количество Ножей:",
+                    currentValue: gameOptions.numberOfKnives,
+                    min: 0,
+                    max: 5,
+                    divisions: 5,
+                    onChanged: (int value) => gameOptions.numberOfKnives = value,
+                  ),
+                  _buildOptionSlider(
+                    context,
+                    label: "Количество Брони:",
+                    currentValue: gameOptions.numberOfDefenseItems,
+                    min: 0,
+                    max: 5,
+                    divisions: 5,
+                    onChanged: (int value) => gameOptions.numberOfDefenseItems = value,
+                  ),
+                  _buildOptionSlider(
+                    context,
+                    label: "Количество Кустов:",
+                    currentValue: gameOptions.numberOfBushes,
+                    min: 0,
+                    max: 30,
+                    divisions: 30,
+                    onChanged: (int value) => gameOptions.numberOfBushes = value,
+                  ),
+                  _buildOptionSlider(
+                    context,
+                    label: "Количество Ящиков:",
+                    currentValue: gameOptions.numberOfChests,
+                    min: 0,
+                    max: 15,
+                    divisions: 15,
+                    onChanged: (int value) => gameOptions.numberOfChests = value,
+                  ),
+                  _buildOptionSlider(
+                    context,
+                    label: "Количество Деревьев:",
+                    currentValue: gameOptions.numberOfTrees,
+                    min: 0,
+                    max: 20,
+                    divisions: 20,
+                    onChanged: (int value) => gameOptions.numberOfTrees = value,
+                  ),
+                  _buildOptionSlider( // НОВЫЙ слайдер для валунов
+                    context,
+                    label: "Количество Валунов:",
+                    currentValue: gameOptions.numberOfBoulders,
+                    min: 0,
+                    max: 10,
+                    divisions: 10,
+                    onChanged: (int value) => gameOptions.numberOfBoulders = value,
+                  ),
+                  const SizedBox(height: 30),
+                  _buildMapSizeSelector(
+                    context,
+                    label: "Размер игрового поля:",
+                    currentValue: gameOptions.mapSize,
+                    onChanged: (MapSizeOption? value) {
+                      if (value != null) {
+                        gameOptions.mapSize = value;
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  // Туман войны переключатель
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 10.0, horizontal: 8.0),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: <Widget>[
+                        const Text(
+                          "Туман войны:",
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 18,
+                            fontFamily: FONT_FAMILY,
+                          ),
+                        ),
+                        Switch(
+                          value: gameOptions.isFogOfWarEnabled,
+                          onChanged: (bool value) {
+                            gameOptions.isFogOfWarEnabled = value;
+                          },
+                          activeColor: Colors.redAccent,
+                          inactiveThumbColor: Colors.grey,
+                          inactiveTrackColor: Colors.grey[700],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 50),
+                  SizedBox(
+                    width: 200,
+                    child: ElevatedButton(
+                      onPressed: onBackToMainMenu,
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 15),
+                        backgroundColor: Colors.blueGrey,
+                        textStyle: const TextStyle(fontSize: 20, color: Colors.white),
+                      ),
+                      child: const Text("Назад в меню"),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Widget for the new Controls and Tutorial screen
+class ControlsScreenWidget extends StatefulWidget {
+  final VoidCallback onBackToMainMenu;
+
+  const ControlsScreenWidget({
+    Key? key,
+    required this.onBackToMainMenu,
+  }) : super(key: key);
+
+  @override
+  State<ControlsScreenWidget> createState() => _ControlsScreenWidgetState();
+}
+
+class _ControlsScreenWidgetState extends State<ControlsScreenWidget> {
+  GameAction? _rebindingAction;
+  late FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode = FocusNode();
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _startRebind(GameAction action) {
+    setState(() {
+      _rebindingAction = action;
+      _focusNode.requestFocus(); // Request focus to capture the next key press
+    });
+    // Visually indicate that the key is pending by setting its binding to null
+    Provider.of<GameControlsData>(context, listen: false).updateKeyBinding(action, null);
+  }
+
+  void _handleKeyEvent(RawKeyEvent event) {
+    if (event is RawKeyDownEvent) {
+      if (_rebindingAction != null) {
+        // If a key is currently being rebound, set the new key
+        Provider.of<GameControlsData>(context, listen: false)
+            .updateKeyBinding(_rebindingAction!, event.logicalKey);
+        setState(() {
+          _rebindingAction = null; // Rebinding finished
+        });
+      } else if (event.logicalKey == LogicalKeyboardKey.escape) {
+        widget.onBackToMainMenu();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final GameControlsData controlsData = Provider.of<GameControlsData>(context);
+
+    return RawKeyboardListener(
+      focusNode: _focusNode,
+      onKey: _handleKeyEvent,
+      autofocus: true,
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: Container(
+            width: 800, // Increased width to accommodate both sections
+            height: 700,
+            decoration: BoxDecoration(
+              color: Colors.grey[900],
+              border: Border.all(color: Colors.white, width: 2),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              children: <Widget>[
+                const Text(
+                  "Управление и Обучение",
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 32,
+                      fontWeight: FontWeight.bold,
+                      fontFamily: FONT_FAMILY),
+                ),
+                const Divider(color: Colors.grey),
+                Expanded(
+                  child: Row(
+                    children: <Widget>[
+                      // Левая панель: Настройки управления
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            const Text(
+                              "Настройка Клавиш:",
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold,
+                                fontFamily: FONT_FAMILY,
+                              ),
+                            ),
+                            const SizedBox(height: 15),
+                            Expanded(
+                              child: ListView.builder(
+                                itemCount: GameAction.values.length,
+                                itemBuilder: (BuildContext context, int index) {
+                                  final GameAction action = GameAction.values[index];
+                                  final LogicalKeyboardKey? currentKey = controlsData.keyBindings[action];
+                                  final String keyName = currentKey == null
+                                      ? "Нажмите клавишу..."
+                                      : currentKey.keyLabel.toUpperCase(); // Display actual key label
+
+                                  return Card(
+                                    color: _rebindingAction == action ? Colors.blue.withOpacity(0.3) : Colors.grey[850],
+                                    margin: const EdgeInsets.symmetric(vertical: 4.0),
+                                    child: ListTile(
+                                      title: Text(
+                                        controlsData.getActionDescription(action),
+                                        style: const TextStyle(color: Colors.white, fontSize: 18, fontFamily: FONT_FAMILY),
+                                      ),
+                                      trailing: ElevatedButton(
+                                        onPressed: () => _startRebind(action),
+                                        style: ElevatedButton.styleFrom(
+                                          backgroundColor: _rebindingAction == action ? Colors.amber : Colors.deepPurple,
+                                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                                        ),
+                                        child: Text(
+                                          keyName,
+                                          style: const TextStyle(color: Colors.white, fontSize: 16, fontFamily: FONT_FAMILY),
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const VerticalDivider(color: Colors.grey),
+                      // Правая панель: Обучение
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            const Text(
+                              "Обучение:",
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold,
+                                fontFamily: FONT_FAMILY,
+                              ),
+                            ),
+                            const SizedBox(height: 15),
+                            Expanded(
+                              child: ListView.builder(
+                                itemCount: controlsData.tutorialMessages.length,
+                                itemBuilder: (BuildContext context, int index) {
+                                  final String message = controlsData.tutorialMessages[index];
+                                  return Padding(
+                                    padding: const EdgeInsets.symmetric(vertical: 4.0),
+                                    child: Text(
+                                      "• $message",
+                                      style: const TextStyle(color: Colors.white70, fontSize: 16, fontFamily: FONT_FAMILY),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(color: Colors.grey),
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 10.0),
+                    child: SizedBox(
+                      width: 150,
+                      child: ElevatedButton(
+                        onPressed: widget.onBackToMainMenu,
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          backgroundColor: Colors.blueGrey,
+                          textStyle: const TextStyle(fontSize: 18, color: Colors.white),
+                        ),
+                        child: const Text("Назад"),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Виджет для отображения содержимого игрового экрана
+class GameScreenContent extends StatelessWidget {
+  final GameState gameState;
+  final bool isZoomedToPlayer;
+  final VoidCallback onRestartGame;
+  final VoidCallback onOpenInventory;
+  final VoidCallback onBackToMainMenu;
+  final VoidCallback onOpenCrafting;
+  final bool isFogOfWarEnabled;
+
+  const GameScreenContent({
+    Key? key,
+    required this.gameState,
+    required this.isZoomedToPlayer,
+    required this.onRestartGame,
+    required this.onOpenInventory,
+    required this.onBackToMainMenu,
+    required this.onOpenCrafting,
+    required this.isFogOfWarEnabled,
+  }) : super(key: key);
+
+  int _calculateEffectiveMapRenderWidth(GameState gameState, bool isZoomedToPlayer) {
+    final int renderWindowDesiredSize = isZoomedToPlayer ? ZOOM_VIEW_SIZE : WIDE_VIEW_SIZE;
+    // For fixed maps, clamp the desired view size to the actual map width if it's smaller.
+    if (gameState.selectedMapSizeOption != MapSizeOption.infinite) {
+      return min(renderWindowDesiredSize, gameState.mapWidth);
+    }
+    return renderWindowDesiredSize;
+  }
+
+  int _calculateEffectiveMapRenderHeight(GameState gameState, bool isZoomedToPlayer) {
+    final int renderWindowDesiredSize = isZoomedToPlayer ? ZOOM_VIEW_SIZE : WIDE_VIEW_SIZE;
+    // For fixed maps, clamp the desired view size to the actual map height if it's smaller.
+    if (gameState.selectedMapSizeOption != MapSizeOption.infinite) {
+      return min(renderWindowDesiredSize, gameState.mapHeight);
+    }
+    return renderWindowDesiredSize;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: <Widget>[
+        Expanded(
+          child: Row(
+            children: <Widget>[
+              // Игровая карта
+              Expanded(
+                child: FittedBox(
+                  fit: BoxFit.contain, // Карта масштабируется, чтобы вписаться
+                  child: SizedBox(
+                    width: (_calculateEffectiveMapRenderWidth(gameState, isZoomedToPlayer)) * TILE_SIZE,
+                    height: (_calculateEffectiveMapRenderHeight(gameState, isZoomedToPlayer)) * TILE_SIZE,
+                    child: CustomPaint(
+                      painter: GameMapPainter(
+                          gameState,
+                          isZoomedToPlayer,
+                          gameState.player.position.x,
+                          gameState.player.position.y,
+                          isFogOfWarEnabled: isFogOfWarEnabled,
+                          selectedMapSizeOption: gameState.selectedMapSizeOption
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              // Панель интерфейса справа
+              SizedBox(
+                width: 250, // Ширина панели интерфейса
+                child: Container(
+                  padding: const EdgeInsets.all(8.0),
+                  color: Colors.grey[900],
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      const Text(
+                        "--- Интерфейс ---",
+                        style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold),
+                      ),
+                      const Divider(color: Colors.grey),
+                      Text(
+                        "Здоровье: ${gameState.player.health}",
+                        style: TextStyle(
+                            color: gameState.player.health > 25
+                                ? Colors.white
+                                : Colors.red, // Низкое здоровье - красный цвет
+                            fontFamily: FONT_FAMILY),
+                      ),
+                      Text(
+                        "Сила: ${gameState.player.strength}",
+                        style: const TextStyle(
+                            color: Colors.white, fontFamily: FONT_FAMILY),
+                      ),
+                      Text(
+                        "Защита: ${gameState.player.defense}", // Отображение защиты
+                        style: const TextStyle(
+                            color: Colors.white, fontFamily: FONT_FAMILY),
+                      ),
+                      Text(
+                        "Ходы: ${gameState.turns}",
+                        style: const TextStyle(
+                            color: Colors.white, fontFamily: FONT_FAMILY),
+                      ),
+                      Text(
+                        "Зомби: ${gameState.zombies.length}",
+                        style: const TextStyle(
+                            color: Colors.white, fontFamily: FONT_FAMILY),
+                      ),
+                      // Отображение количества патронов
+                      Text(
+                        "Патроны: ${gameState.player.inventory.firstWhereOrNull((i) => i.itemType == ItemType.ammo)?.quantity ?? 0}",
+                        style: const TextStyle(
+                            color: Colors.white, fontFamily: FONT_FAMILY),
+                      ),
+                      const Divider(color: Colors.grey),
+                      // Кнопка инвентаря
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: onOpenInventory,
+                          icon: const Icon(Icons.inventory, color: Colors.white),
+                          label: const Text("Инвентарь (I)", style: TextStyle(color: Colors.white)),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.deepOrange,
+                            textStyle: const TextStyle(fontSize: 16, color: Colors.white),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8), // Отступ
+                      // Кнопка крафта
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: onOpenCrafting,
+                          icon: const Icon(Icons.build, color: Colors.white),
+                          label: const Text("Крафт (C)", style: TextStyle(color: Colors.white)),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.indigo,
+                            textStyle: const TextStyle(fontSize: 16, color: Colors.white),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8), // Добавлен отступ
+                      // Кнопка выхода в главное меню
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: onBackToMainMenu,
+                          icon: const Icon(Icons.exit_to_app, color: Colors.white),
+                          label: const Text("Главное меню (Q)", style: TextStyle(color: Colors.white)),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blueGrey,
+                            textStyle: const TextStyle(fontSize: 16, color: Colors.white),
+                          ),
+                        ),
+                      ),
+                      const Divider(color: Colors.grey),
+                      const Text(
+                        "Сообщения:",
+                        style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold),
+                      ),
+                      Expanded(
+                        child: SingleChildScrollView(
+                          // Прокрутка для лога сообщений
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: gameState.messageLog
+                                .map<Widget>((String msg) => Text(
+                                      msg,
+                                      style: const TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 12,
+                                          fontFamily: FONT_FAMILY),
+                                    ))
+                                .toList(),
+                          ),
+                        ),
+                      ),
+                      if (gameState.isGameOver)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 16.0),
+                          child: Center(
+                            child: Column(
+                              children: <Widget>[
+                                Text(
+                                  gameState.player.isAlive()
+                                      ? "ПОБЕДА!"
+                                      : "ИГРА ОКОНЧЕНА",
+                                  style: TextStyle(
+                                      color: gameState.player.isAlive()
+                                          ? Colors.yellow
+                                          : Colors.red,
+                                      fontSize: 24,
+                                      fontWeight: FontWeight.bold),
+                                ),
+                                ElevatedButton(
+                                  onPressed: onRestartGame,
+                                  style: ElevatedButton.styleFrom(
+                                    foregroundColor: Colors.white,
+                                    backgroundColor: Colors.blue,
+                                  ),
+                                  child: const Text("Начать заново"),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Виджет для экрана инвентаря
+class InventoryScreenWidget extends StatefulWidget {
+  final GameState gameState;
+  final VoidCallback onBack;
+  final Function(InventoryItem item, int quantity) onUseItem;
+
+  const InventoryScreenWidget({
+    Key? key,
+    required this.gameState,
+    required this.onBack,
+    required this.onUseItem,
+  }) : super(key: key);
+
+  @override
+  State<InventoryScreenWidget> createState() => _InventoryScreenWidgetState();
+}
+
+class _InventoryScreenWidgetState extends State<InventoryScreenWidget> {
+  int _selectedIndex = 0;
+  bool _isUsePanelOpen = false;
+  int _quantityToUse = 1;
+  late FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode = FocusNode();
+    _focusNode.requestFocus();
+    // Убедиться, что _selectedIndex корректен при инициализации, если инвентарь не пуст
+    if (widget.gameState.player.inventory.isNotEmpty) {
+      _selectedIndex = 0;
+    } else {
+      _selectedIndex = -1; // Нет выбранного элемента, если инвентарь пуст
+    }
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleKeyEvent(RawKeyEvent event) {
+    if (event is RawKeyDownEvent) {
+      if (widget.gameState.player.inventory.isEmpty) {
+        if (event.logicalKey == LogicalKeyboardKey.escape) {
+          widget.onBack();
+        }
+        return;
+      }
+
+      if (_isUsePanelOpen) {
+        // Обработка ввода для панели использования предмета
+        switch (event.logicalKey) {
+          case LogicalKeyboardKey.arrowUp:
+            setState(() {
+              if (_selectedIndex != -1 &&
+                  _quantityToUse < widget.gameState.player.inventory[_selectedIndex].quantity) {
+                _quantityToUse++;
+              }
+            });
+            break;
+          case LogicalKeyboardKey.arrowDown:
+            setState(() {
+              if (_quantityToUse > 1) {
+                _quantityToUse--;
+              }
+            });
+            break;
+          case LogicalKeyboardKey.enter:
+            _useSelectedItem();
+            break;
+          case LogicalKeyboardKey.escape:
+            setState(() {
+              _isUsePanelOpen = false;
+              _quantityToUse = 1;
+            });
+            break;
+        }
+      } else {
+        // Обработка ввода для навигации по списку инвентаря
+        switch (event.logicalKey) {
+          case LogicalKeyboardKey.arrowUp:
+            setState(() {
+              _selectedIndex =
+                  (_selectedIndex - 1).clamp(0, widget.gameState.player.inventory.length - 1);
+            });
+            break;
+          case LogicalKeyboardKey.arrowDown:
+            setState(() {
+              _selectedIndex =
+                  (_selectedIndex + 1).clamp(0, widget.gameState.player.inventory.length - 1);
+            });
+            break;
+          case LogicalKeyboardKey.escape:
+            widget.onBack();
+            break;
+          case LogicalKeyboardKey.enter:
+            if (widget.gameState.player.inventory.isNotEmpty) {
+              setState(() {
+                _isUsePanelOpen = true;
+                _quantityToUse = 1; // Сброс количества при открытии панели
+              });
+            }
+            break;
+        }
+      }
+    }
+  }
+
+  void _useSelectedItem() {
+    if (widget.gameState.player.inventory.isNotEmpty &&
+        _selectedIndex != -1 &&
+        _selectedIndex < widget.gameState.player.inventory.length) {
+      InventoryItem selectedItem = widget.gameState.player.inventory[_selectedIndex];
+
+      // Палки, листья, лом, пистолет, патроны, топор, бревно, камни, каменный топор нельзя использовать из инвентаря
+      if (selectedItem.itemType == ItemType.sticks ||
+          selectedItem.itemType == ItemType.leaves ||
+          selectedItem.itemType == ItemType.crowbar ||
+          selectedItem.itemType == ItemType.pistol ||
+          selectedItem.itemType == ItemType.ammo ||
+          selectedItem.itemType == ItemType.axe ||
+          selectedItem.itemType == ItemType.log ||
+          selectedItem.itemType == ItemType.improvedCrowbar ||
+          selectedItem.itemType == ItemType.stones || // НОВОЕ: Камни нельзя использовать
+          selectedItem.itemType == ItemType.stoneAxe) { // НОВОЕ: Каменный топор нельзя использовать
+        widget.gameState.addMessage(
+            "Предмет '${selectedItem.name}' ничего не делает при использовании.");
+        setState(() {
+          _isUsePanelOpen = false;
+          _quantityToUse = 1;
+        });
+        widget.onBack(); // Возвращаемся в игру
+        return;
+      }
+
+      widget.onUseItem(selectedItem, _quantityToUse);
+      setState(() {
+        _isUsePanelOpen = false;
+        _quantityToUse = 1;
+        // После использования предмета, родительский виджет обновит состояние инвентаря,
+        // поэтому нам нужно только скорректировать _selectedIndex, если элемент был удален.
+        if (widget.gameState.player.inventory.isEmpty) {
+          _selectedIndex = -1; // Инвентарь пуст, нет выбранных элементов
+        } else if (_selectedIndex >= widget.gameState.player.inventory.length) {
+          _selectedIndex = widget.gameState.player.inventory.length - 1;
+        }
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final List<InventoryItem> inventory = widget.gameState.player.inventory;
+
+    return RawKeyboardListener(
+      focusNode: _focusNode,
+      onKey: _handleKeyEvent,
+      autofocus: true,
+      child: Center(
+        child: Container(
+          width: 500,
+          height: 600,
+          decoration: BoxDecoration(
+            color: Colors.grey[900],
+            border: Border.all(color: Colors.white, width: 2),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            children: <Widget>[
+              const Text(
+                "Инвентарь",
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    fontFamily: FONT_FAMILY),
+              ),
+              const Divider(color: Colors.grey),
+              if (inventory.isEmpty)
+                Expanded(
+                  child: Center(
+                    child: Text(
+                      "Инвентарь пуст.",
+                      style:
+                          TextStyle(color: Colors.white70, fontSize: 18, fontFamily: FONT_FAMILY),
+                    ),
+                  ),
+                )
+              else
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: inventory.length,
+                    itemBuilder: (BuildContext context, int index) {
+                      final InventoryItem item = inventory[index];
+                      final bool isSelected = index == _selectedIndex;
+
+                      String itemDisplay;
+                      if (item.itemType == ItemType.crowbar ||
+                          item.itemType == ItemType.axe ||
+                          item.itemType == ItemType.improvedCrowbar ||
+                          item.itemType == ItemType.stoneAxe) { // НОВОЕ: Каменный топор
+                        itemDisplay =
+                            "${item.name} (Использований: ${item.currentDurability ?? 0}/${item.maxDurability ?? 0})";
+                      } else {
+                        itemDisplay = "${item.name} (x${item.quantity})";
+                      }
+
+                      return GestureDetector(
+                        onTap: () {
+                          setState(() {
+                            _selectedIndex = index;
+                            if (!_isUsePanelOpen) {
+                              _isUsePanelOpen = true;
+                              _quantityToUse = 1;
+                            }
+                          });
+                        },
+                        child: Container(
+                          color: isSelected ? Colors.blue.withOpacity(0.5) : Colors.transparent,
+                          padding:
+                              const EdgeInsets.symmetric(vertical: 8.0, horizontal: 10.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              Text(
+                                itemDisplay,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 20,
+                                  fontFamily: FONT_FAMILY,
+                                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                ),
+                              ),
+                              Text(
+                                item.description,
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 14,
+                                  fontFamily: FONT_FAMILY,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              const Divider(color: Colors.grey),
+              if (_isUsePanelOpen && inventory.isNotEmpty && _selectedIndex != -1 && _selectedIndex < inventory.length)
+                _buildUseItemPanel(context, inventory[_selectedIndex]),
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 10.0),
+                  child: SizedBox(
+                    width: 150,
+                    child: ElevatedButton(
+                      onPressed: widget.onBack,
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        backgroundColor: Colors.blueGrey,
+                        textStyle: const TextStyle(fontSize: 18, color: Colors.white),
+                      ),
+                      child: const Text("Назад"),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUseItemPanel(BuildContext context, InventoryItem selectedItem) {
+    // Палки, листья, лом, пистолет, патроны, топор, бревно, камни, улучшенный лом, каменный топор нельзя использовать
+    bool canBeUsed = !(selectedItem.itemType == ItemType.sticks ||
+        selectedItem.itemType == ItemType.leaves ||
+        selectedItem.itemType == ItemType.crowbar ||
+        selectedItem.itemType == ItemType.pistol ||
+        selectedItem.itemType == ItemType.ammo ||
+        selectedItem.itemType == ItemType.axe ||
+        selectedItem.itemType == ItemType.log ||
+        selectedItem.itemType == ItemType.improvedCrowbar ||
+        selectedItem.itemType == ItemType.stones ||
+        selectedItem.itemType == ItemType.stoneAxe);
+
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: Colors.grey[800],
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.blue, width: 1),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Text(
+            "Использовать ${selectedItem.name}?",
+            style: TextStyle(color: Colors.white, fontSize: 20, fontFamily: FONT_FAMILY),
+          ),
+          const SizedBox(height: 10),
+          if (canBeUsed) ...<Widget>[
+            Text(
+              "Количество: $_quantityToUse",
+              style: TextStyle(color: Colors.white70, fontSize: 16, fontFamily: FONT_FAMILY),
+            ),
+            Slider(
+              value: _quantityToUse.toDouble(),
+              min: 1,
+              max: selectedItem.quantity.toDouble(),
+              divisions: (selectedItem.quantity > 1) ? selectedItem.quantity - 1 : 1,
+              label: _quantityToUse.toString(),
+              onChanged: (double value) {
+                setState(() {
+                  _quantityToUse = value.toInt();
+                });
+              },
+              activeColor: Colors.lightBlueAccent,
+              inactiveColor: Colors.grey[600],
+            ),
+            const SizedBox(height: 10),
+            MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: _useSelectedItem,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.green,
+                    borderRadius: BorderRadius.circular(5),
+                  ),
+                  child: const Text(
+                    "OK",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ] else
+            Text(
+              "Этот предмет нельзя использовать.",
+              style: TextStyle(color: Colors.white70, fontSize: 16, fontFamily: FONT_FAMILY),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Виджет для экрана достижений
+class AchievementsScreenWidget extends StatelessWidget {
+  final VoidCallback onBackToMainMenu;
+
+  const AchievementsScreenWidget({
+    Key? key,
+    required this.onBackToMainMenu,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Center(
+        child: Container(
+          width: 600,
+          height: 600,
+          decoration: BoxDecoration(
+            color: Colors.grey[900],
+            border: Border.all(color: Colors.white, width: 2),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            children: <Widget>[
+              const Text(
+                "Достижения",
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    fontFamily: FONT_FAMILY),
+              ),
+              const Divider(color: Colors.grey),
+              Expanded(
+                child: Consumer<GameAchievementsData>(
+                  builder: (BuildContext context, GameAchievementsData achievementsData, Widget? child) {
+                    final List<Achievement> achievements = achievementsData.achievements;
+                    if (achievements.isEmpty) {
+                      return Center(
+                        child: Text(
+                          "Нет доступных достижений.",
+                          style: TextStyle(color: Colors.white70, fontSize: 18, fontFamily: FONT_FAMILY),
+                        ),
+                      );
+                    }
+                    return ListView.builder(
+                      itemCount: achievements.length,
+                      itemBuilder: (BuildContext context, int index) {
+                        final Achievement achievement = achievements[index];
+                        return Card(
+                          color: Colors.grey[850],
+                          margin: const EdgeInsets.symmetric(vertical: 8.0),
+                          child: Padding(
+                            padding: const EdgeInsets.all(12.0),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: <Widget>[
+                                Icon(
+                                  achievement.isUnlocked ? Icons.check_circle : Icons.lock,
+                                  color: achievement.isUnlocked ? Colors.greenAccent : Colors.grey,
+                                  size: 30,
+                                ),
+                                const SizedBox(width: 15),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        achievement.name,
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 22,
+                                          fontWeight: FontWeight.bold,
+                                          fontFamily: FONT_FAMILY,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 5),
+                                      Text(
+                                        achievement.description,
+                                        style: TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 16,
+                                          fontFamily: FONT_FAMILY,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+              const Divider(color: Colors.grey),
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 10.0),
+                  child: SizedBox(
+                    width: 150,
+                    child: ElevatedButton(
+                      onPressed: onBackToMainMenu,
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        backgroundColor: Colors.blueGrey,
+                        textStyle: const TextStyle(fontSize: 18, color: Colors.white),
+                      ),
+                      child: const Text("Назад"),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Виджет для экрана крафта
+class CraftingScreenWidget extends StatefulWidget {
+  final GameState gameState;
+  final VoidCallback onBack;
+  final Function(CraftingRecipe recipe) onCraftItem;
+
+  const CraftingScreenWidget({
+    Key? key,
+    required this.gameState,
+    required this.onBack,
+    required this.onCraftItem,
+  }) : super(key: key);
+
+  @override
+  State<CraftingScreenWidget> createState() => _CraftingScreenWidgetState();
+}
+
+class _CraftingScreenWidgetState extends State<CraftingScreenWidget> {
+  int _selectedIndex = 0;
+  bool _isConfirmPanelOpen = false;
+  CraftingRecipe? _recipeToConfirm;
+  late FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode = FocusNode();
+    _focusNode.requestFocus();
+    if (allCraftingRecipes.isNotEmpty) {
+      _selectedIndex = 0;
+    } else {
+      _selectedIndex = -1;
+    }
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleKeyEvent(RawKeyEvent event) {
+    if (event is RawKeyDownEvent) {
+      if (allCraftingRecipes.isEmpty) {
+        if (event.logicalKey == LogicalKeyboardKey.escape) {
+          widget.onBack();
+        }
+        return;
+      }
+
+      if (_isConfirmPanelOpen) {
+        // Обработка ввода для панели подтверждения
+        switch (event.logicalKey) {
+          case LogicalKeyboardKey.enter:
+            _confirmCraft();
+            break;
+          case LogicalKeyboardKey.escape:
+            _cancelCraft();
+            break;
+        }
+      } else {
+        // Обработка ввода для навигации по списку рецептов
+        switch (event.logicalKey) {
+          case LogicalKeyboardKey.arrowUp:
+            setState(() {
+              _selectedIndex =
+                  (_selectedIndex - 1).clamp(0, allCraftingRecipes.length - 1);
+            });
+            break;
+          case LogicalKeyboardKey.arrowDown:
+            setState(() {
+              _selectedIndex =
+                  (_selectedIndex + 1).clamp(0, allCraftingRecipes.length - 1);
+            });
+            break;
+          case LogicalKeyboardKey.escape:
+            widget.onBack();
+            break;
+          case LogicalKeyboardKey.enter:
+            if (_selectedIndex != -1 && _selectedIndex < allCraftingRecipes.length) {
+              _requestCraftConfirmation(allCraftingRecipes[_selectedIndex]);
+            }
+            break;
+        }
+      }
+    }
+  }
+
+  void _requestCraftConfirmation(CraftingRecipe recipe) {
+    if (!recipe.canCraft(widget.gameState.player)) {
+      widget.gameState.addMessage("Недостаточно компонентов для ${recipe.craftedItemName}.");
+      return;
+    }
+    setState(() {
+      _recipeToConfirm = recipe;
+      _isConfirmPanelOpen = true;
+    });
+  }
+
+  void _confirmCraft() {
+    if (_recipeToConfirm != null) {
+      widget.onCraftItem(_recipeToConfirm!);
+      setState(() {
+        _isConfirmPanelOpen = false;
+        _recipeToConfirm = null;
+      });
+    }
+  }
+
+  void _cancelCraft() {
+    setState(() {
+      _isConfirmPanelOpen = false;
+      _recipeToConfirm = null;
+    });
+  }
+
+  // Helper to get total quantity of a specific item type
+  int _getTotalItemQuantity(ItemType type) {
+    if (type == ItemType.crowbar ||
+        type == ItemType.axe ||
+        type == ItemType.improvedCrowbar ||
+        type == ItemType.stoneAxe) { // НОВОЕ: Каменный топор
+      return widget.gameState.player.inventory
+          .where((InventoryItem item) => item.itemType == type && (item.currentDurability ?? 0) > 0)
+          .length;
+    }
+    return widget.gameState.player.inventory
+        .firstWhereOrNull((InventoryItem item) => item.itemType == type)
+        ?.quantity ?? 0;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RawKeyboardListener(
+      focusNode: _focusNode,
+      onKey: _handleKeyEvent,
+      autofocus: true,
+      child: Center(
+        child: Container(
+          width: 600,
+          height: 600,
+          decoration: BoxDecoration(
+            color: Colors.grey[900],
+            border: Border.all(color: Colors.white, width: 2),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            children: <Widget>[
+              const Text(
+                "Крафт",
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    fontFamily: FONT_FAMILY),
+              ),
+              const Divider(color: Colors.grey),
+              Expanded(
+                child: allCraftingRecipes.isEmpty
+                    ? Center(
+                        child: Text(
+                          "Нет доступных рецептов для крафта.",
+                          style: TextStyle(
+                              color: Colors.white70, fontSize: 18, fontFamily: FONT_FAMILY),
+                        ),
+                      )
+                    : _isConfirmPanelOpen && _recipeToConfirm != null
+                        ? _buildConfirmCraftPanel(_recipeToConfirm!)
+                        : ListView.builder(
+                            itemCount: allCraftingRecipes.length,
+                            itemBuilder: (BuildContext context, int index) {
+                              final CraftingRecipe recipe = allCraftingRecipes[index];
+                              final bool isSelected = index == _selectedIndex;
+                              final bool canCraft = recipe.canCraft(widget.gameState.player);
+
+                              return GestureDetector(
+                                onTap: () {
+                                  setState(() {
+                                    _selectedIndex = index;
+                                  });
+                                  if (canCraft) {
+                                    _requestCraftConfirmation(recipe);
+                                  } else {
+                                    widget.gameState.addMessage("Недостаточно компонентов для ${recipe.craftedItemName}.");
+                                  }
+                                },
+                                child: Container(
+                                  color: isSelected ? Colors.blue.withOpacity(0.5) : Colors.transparent,
+                                  padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 10.0),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        recipe.craftedItemName,
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 20,
+                                          fontFamily: FONT_FAMILY,
+                                          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                        ),
+                                      ),
+                                      Text(
+                                        recipe.craftedItemDescription,
+                                        style: TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 14,
+                                          fontFamily: FONT_FAMILY,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 5),
+                                      Text(
+                                        "Требуется:",
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 14,
+                                          fontFamily: FONT_FAMILY,
+                                        ),
+                                      ),
+                                      ...recipe.requiredComponents.entries.map<Widget>((MapEntry<ItemType, int> entry) {
+                                        final ItemType requiredType = entry.key;
+                                        final int requiredQuantity = entry.value;
+                                        final int playerQuantity = _getTotalItemQuantity(requiredType);
+                                        final bool hasEnough = playerQuantity >= requiredQuantity;
+
+                                        return Text(
+                                          "  - ${InventoryItem.fromType(requiredType).name}: $requiredQuantity (У вас: $playerQuantity)",
+                                          style: TextStyle(
+                                            color: hasEnough ? Colors.greenAccent : Colors.redAccent,
+                                            fontSize: 12,
+                                            fontFamily: FONT_FAMILY,
+                                          ),
+                                        );
+                                      }).toList(),
+                                      if (isSelected && !canCraft)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 5.0),
+                                          child: Text(
+                                            "Недостаточно компонентов!",
+                                            style: TextStyle(
+                                              color: Colors.redAccent,
+                                              fontSize: 14,
+                                              fontFamily: FONT_FAMILY,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+              ),
+              const Divider(color: Colors.grey),
+              if (!_isConfirmPanelOpen)
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 10.0),
+                    child: Column(
+                      children: <Widget>[
+                        SizedBox(
+                          width: 150,
+                          child: ElevatedButton(
+                            onPressed: (_selectedIndex != -1 && allCraftingRecipes[_selectedIndex].canCraft(widget.gameState.player))
+                                ? () => _requestCraftConfirmation(allCraftingRecipes[_selectedIndex])
+                                : null,
+                            style: ElevatedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              backgroundColor: Colors.green,
+                              textStyle: const TextStyle(fontSize: 18, color: Colors.white),
+                            ),
+                            child: const Text("Крафт (Enter)"),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: 150,
+                          child: ElevatedButton(
+                            onPressed: widget.onBack,
+                            style: ElevatedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              backgroundColor: Colors.blueGrey,
+                              textStyle: const TextStyle(fontSize: 18, color: Colors.white),
+                            ),
+                            child: const Text("Назад"),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildConfirmCraftPanel(CraftingRecipe recipe) {
+    return Container(
+      margin: const EdgeInsets.only(top: 20),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.grey[800],
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.blue, width: 2),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Text(
+            "Создать ${recipe.craftedItemName}?",
+            style: TextStyle(color: Colors.white, fontSize: 24, fontFamily: FONT_FAMILY),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 10),
+          Text(
+            recipe.craftedItemDescription,
+            style: TextStyle(color: Colors.white70, fontSize: 16, fontFamily: FONT_FAMILY),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 15),
+          Text(
+            "Требуемые компоненты:",
+            style: TextStyle(color: Colors.white, fontSize: 18, fontFamily: FONT_FAMILY),
+          ),
+          ...recipe.requiredComponents.entries.map<Widget>((MapEntry<ItemType, int> entry) {
+            final ItemType requiredType = entry.key;
+            final int requiredQuantity = entry.value;
+            final int playerQuantity = _getTotalItemQuantity(requiredType);
+            final bool hasEnough = playerQuantity >= requiredQuantity;
+
+            return Text(
+              "  - ${InventoryItem.fromType(requiredType).name}: $requiredQuantity (У вас: $playerQuantity)",
+              style: TextStyle(
+                color: hasEnough ? Colors.greenAccent : Colors.redAccent,
+                fontSize: 14,
+                fontFamily: FONT_FAMILY,
+              ),
+            );
+          }).toList(),
+          const SizedBox(height: 20),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: <Widget>[
+              SizedBox(
+                width: 120,
+                child: ElevatedButton(
+                  onPressed: _confirmCraft,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    textStyle: const TextStyle(fontSize: 18, color: Colors.white),
+                  ),
+                  child: const Text("Да (Enter)"),
+                ),
+              ),
+              SizedBox(
+                width: 120,
+                child: ElevatedButton(
+                  onPressed: _cancelCraft,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    textStyle: const TextStyle(fontSize: 18, color: Colors.white),
+                  ),
+                  child: const Text("Нет (Escape)"),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Виджет для баннера подтверждения выхода
+class ExitConfirmationOverlay extends StatelessWidget {
+  final VoidCallback onConfirm;
+  final VoidCallback onCancel;
+
+  const ExitConfirmationOverlay({
+    Key? key,
+    required this.onConfirm,
+    required this.onCancel,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: Colors.black.withOpacity(0.7), // Semi-transparent black background
+      alignment: Alignment.center,
+      child: Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: Colors.grey[900],
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.white, width: 2),
+        ),
+        width: 400,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            const Text(
+              "Выход в главное меню?",
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+                fontFamily: FONT_FAMILY,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 15),
+            const Text(
+              "Вы уверены, что хотите выйти? Прогресс будет потерян.",
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: 16,
+                fontFamily: FONT_FAMILY,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 30),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: <Widget>[
+                ElevatedButton(
+                  onPressed: onConfirm,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.redAccent,
+                    padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 12),
+                  ),
+                  child: const Text("Да (Y/Enter)", style: TextStyle(color: Colors.white, fontSize: 18)),
+                ),
+                ElevatedButton(
+                  onPressed: onCancel,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blueGrey,
+                    padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 12),
+                  ),
+                  child: const Text("Нет (N/Escape)", style: TextStyle(color: Colors.white, fontSize: 18)),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// --- Основной виджет игры/приложения ---
+
+class ZombieRoguelikeGame extends StatefulWidget {
+  const ZombieRoguelikeGame({Key? key}) : super(key: key);
+
+  @override
+  State<ZombieRoguelikeGame> createState() => _ZombieRoguelikeGameState();
+}
+
+class _ZombieRoguelikeGameState extends State<ZombieRoguelikeGame> {
+  AppScreen _currentScreen = AppScreen.mainMenu;
+  GameState? _gameState;
+  late FocusNode _focusNode;
+  bool _isZoomedToPlayer = false; // Состояние для приближения карты
+  bool _hasAxeBeenDropped = false; // Флаг для одноразового выпадения топора
+  bool _showExitConfirmation = false; // New: State for exit confirmation banner
+
+  // Список возможных случайных предметов для ящиков
+  final List<ItemType> _chestPossibleItems = <ItemType>[
+    ItemType.healthPack,
+    ItemType.knife,
+    ItemType.defenseBoost,
+    ItemType.sticks,
+    ItemType.leaves,
+    ItemType.pistol,
+    ItemType.ammo,
+    ItemType.crowbar,
+    ItemType.log, // Бревно может выпасть из ящиков
+    ItemType.stones, // НОВОЕ: Камни могут выпасть из ящиков
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode = FocusNode();
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  /// Обработчик событий клавиатуры
+  void _handleKeyEvent(RawKeyEvent event) {
+    if (event is RawKeyDownEvent) {
+      final GameControlsData controlsData = Provider.of<GameControlsData>(context, listen: false);
+      final Map<GameAction, LogicalKeyboardKey?> keyBindings = controlsData.keyBindings;
+
+      // Handle exit confirmation keys first if the banner is shown
+      if (_currentScreen == AppScreen.game && _showExitConfirmation) {
+        if (event.logicalKey == LogicalKeyboardKey.keyY || event.logicalKey == LogicalKeyboardKey.enter) {
+          _confirmExitGame(); // User confirms exit
+          return; // Event consumed
+        } else if (event.logicalKey == LogicalKeyboardKey.keyN || event.logicalKey == LogicalKeyboardKey.escape) {
+          _cancelExitGame(); // User cancels exit
+          return; // Event consumed
+        }
+        return; // Any other key when banner is open is ignored
+      }
+
+      if (_currentScreen == AppScreen.game) {
+        int dx = 0, dy = 0;
+        bool playerMoved = false;
+        bool playerActioned = false; // Флаг для любого действия, занимающего ход
+
+        // Определяем направление движения игрока по нажатой клавише
+        if (event.logicalKey == keyBindings[GameAction.moveUp]) {
+          dy = -1;
+          playerMoved = true;
+        } else if (event.logicalKey == keyBindings[GameAction.moveLeft]) {
+          dx = -1;
+          playerMoved = true;
+        } else if (event.logicalKey == keyBindings[GameAction.moveDown]) {
+          dy = 1;
+          playerMoved = true;
+        } else if (event.logicalKey == keyBindings[GameAction.moveRight]) {
+          dx = 1;
+          playerMoved = true;
+        } else if (event.logicalKey == keyBindings[GameAction.toggleZoom]) {
+          setState(() {
+            _isZoomedToPlayer = !_isZoomedToPlayer;
+          });
+          return; // 'Z' не является ходом, не нужно запускать ход зомби
+        } else if (event.logicalKey == keyBindings[GameAction.openInventory]) {
+          _navigateToInventory();
+          return; // Открытие инвентаря не занимает ход
+        } else if (event.logicalKey == keyBindings[GameAction.openCrafting]) {
+          _navigateToCrafting();
+          return; // Открытие меню крафта не занимает ход
+        } else if (event.logicalKey == keyBindings[GameAction.breakBush]) {
+          _breakBushAction();
+          playerActioned = true;
+        } else if (event.logicalKey == keyBindings[GameAction.openChest]) {
+          _openChestAction();
+          playerActioned = true;
+        } else if (event.logicalKey == keyBindings[GameAction.chopTree]) {
+          _chopTreeAction();
+          playerActioned = true;
+        } else if (event.logicalKey == keyBindings[GameAction.breakBoulder]) { // НОВОЕ действие
+          _breakBoulderAction();
+          playerActioned = true;
+        } else if (event.logicalKey == keyBindings[GameAction.shoot]) {
+          _shootAction();
+          playerActioned = true;
+        } else if (event.logicalKey == keyBindings[GameAction.backToMainMenu]) {
+          // Show confirmation instead of directly going back to main menu
+          setState(() {
+            _showExitConfirmation = true;
+          });
+          return; // 'Q' pressed, banner is shown, don't proceed with game turn
+        }
+
+        if (playerMoved || playerActioned) {
+          if (_gameState == null || _gameState!.isGameOver) return;
+          if (playerMoved) {
+            _playerTurn(dx, dy); // Ход игрока
+          }
+          if (!_gameState!.isGameOver) {
+            _zombieTurn(); // Ход зомби, если игра не окончена
+          }
+          setState(() {
+            _gameState!.turns++; // Увеличиваем счетчик ходов
+            _gameState!.updateExploredTiles(); // Обновляем исследованные тайлы после хода
+          });
+        }
+      } else if (_currentScreen == AppScreen.achievements || _currentScreen == AppScreen.gameOptions) {
+        // These screens currently handle escape via their own RawKeyboardListener,
+        // but this acts as a fallback or for other unhandled keys.
+        if (event.logicalKey == LogicalKeyboardKey.escape) {
+          _backToMainMenu();
+        }
+      } else {
+        // For Inventory, Crafting, Controls screens, their RawKeyboardListeners should handle events
+        // and only bubble up if they don't consume the event.
+        // For 'Back' action from Inventory/Crafting, it is `onBack` in their respective widgets.
+        // For `ControlsScreenWidget`, it handles its own escape.
+      }
+    }
+  }
+
+  /// Логика хода игрока
+  void _playerTurn(int dx, int dy) {
+    final Player player = _gameState!.player;
+    int newX = player.position.x + dx;
+    int newY = player.position.y + dy;
+
+    // Check water status BEFORE moving
+    TileType currentTileType = _gameState!._getTileTypeAt(player.position.x, player.position.y);
+    if (currentTileType != TileType.water) {
+      player.turnsInWater = 0;
+      player.lastPositionInWater = null;
+    }
+
+    // Step 1: Check if the *terrain* itself is walkable.
+    if (!_gameState!._isTerrainWalkable(newX, newY)) { // Using the new function
+      _gameState!.addMessage("Стена, куст, ящик, дерево или валун блокирует путь.");
+      return;
+    }
+
+    // Step 2: Check if the new position is occupied by another actor (zombie)
+    Zombie? targetZombie = _gameState!.zombies.firstWhereOrNull(
+      (Zombie z) => z.position.x == newX && z.position.y == newY,
+    );
+
+    if (targetZombie != null) {
+      // If there's a zombie, engage in combat
+      _combat(player, targetZombie, false);
+      // Если зомби умер, удаляем его
+      if (!targetZombie.isAlive()) {
+        Provider.of<GameAchievementsData>(context, listen: false).recordFirstZombieKill();
+        _gameState!.zombies.remove(targetZombie);
+        _gameState!.addMessage("Зомби уничтожен!");
+        if (_gameState!.zombies.isEmpty) {
+          _gameState!.addMessage("Все зомби уничтожены! Вы победили!");
+          _gameState!.isGameOver = true;
+        }
+      }
+    } else {
+      // Иначе перемещаем игрока
+      player.position.x = newX;
+      player.position.y = newY;
+      _gameState!.addMessage("Вы двинулись.");
+      _gameState!.updateExploredTiles(); // Обновляем исследованные тайлы при движении
+
+      // Check water status AFTER moving
+      TileType newTileType = _gameState!._getTileTypeAt(newX, newY);
+      if (newTileType == TileType.water) {
+        if (player.lastPositionInWater == null || player.lastPositionInWater != player.position) {
+          player.turnsInWater = 1; // First turn in water at this new location
+        } else {
+          player.turnsInWater++;
+        }
+        player.lastPositionInWater = player.position;
+        if (player.turnsInWater == 1) {
+          _gameState!.addMessage("Вы вошли в воду.");
+        } else if (player.turnsInWater > DROWNING_TURNS) {
+          player.health -= DROWNING_DAMAGE;
+          _gameState!.addMessage("Вы начинаете тонуть! Получено $DROWNING_DAMAGE урона. Здоровье: ${player.health}");
+          if (!player.isAlive()) {
+            _gameState!.addMessage("Вы утонули. ИГРА ОКОНЧЕНА!");
+            _gameState!.isGameOver = true;
+          }
+        }
+      } else {
+        player.turnsInWater = 0;
+        player.lastPositionInWater = null;
+      }
+
+      // Проверяем наличие аптечки на новой позиции и добавляем в инвентарь
+      int hpIndex =
+          _gameState!.healthPacks.indexWhere((Position hp) => hp.x == newX && hp.y == newY);
+      if (hpIndex != -1) {
+        InventoryItem healthPackItem = InventoryItem.fromType(ItemType.healthPack);
+        _addOrUpdateInventoryItem(healthPackItem);
+        _gameState!.healthPacks.removeAt(hpIndex);
+        _gameState!.addMessage("Вы подобрали аптечку.");
+      }
+
+      // Проверяем наличие ножа на новой позиции и добавляем в инвентарь
+      int knifeIndex =
+          _gameState!.knives.indexWhere((Position k) => k.x == newX && k.y == newY);
+      if (knifeIndex != -1) {
+        InventoryItem knifeItem = InventoryItem.fromType(ItemType.knife);
+        _addOrUpdateInventoryItem(knifeItem);
+        _gameState!.knives.removeAt(knifeIndex);
+        _gameState!.addMessage("Вы подобрали нож.");
+      }
+
+      // Проверяем наличие предмета защиты на новой позиции и добавляем в инвентарь
+      int defenseIndex =
+          _gameState!.defenseItems.indexWhere((Position d) => d.x == newX && d.y == newY);
+      if (defenseIndex != -1) {
+        InventoryItem defenseItem = InventoryItem.fromType(ItemType.defenseBoost);
+        _addOrUpdateInventoryItem(defenseItem);
+        _gameState!.defenseItems.removeAt(defenseIndex);
+        _gameState!.addMessage("Вы подобрали броню.");
+      }
+    }
+  }
+
+  /// Обработка действия по ломанию куста
+  void _breakBushAction() {
+    if (_gameState == null || _gameState!.isGameOver) return;
+
+    final Player player = _gameState!.player;
+    Position playerPos = player.position;
+
+    Position? bushToBreak; // Используем nullable Position для поиска
+    // Ищем куст на соседних клетках (3x3 область вокруг игрока)
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) continue; // Пропускаем позицию самого игрока
+
+        Position adjacentPos = Position(playerPos.x + dx, playerPos.y + dy);
+
+        // Проверяем границы карты для фиксированных размеров
+        if (_gameState!.selectedMapSizeOption != MapSizeOption.infinite &&
+            (adjacentPos.x < 0 || adjacentPos.x >= _gameState!.mapWidth ||
+             adjacentPos.y < 0 || adjacentPos.y >= _gameState!.mapHeight)) {
+          continue;
+        }
+
+        // Используем _getTileTypeAt для определения типа тайла, который учитывает как _fixedMap, так и Perlin, и _overriddenTiles
+        if (_gameState!._getTileTypeAt(adjacentPos.x, adjacentPos.y) == TileType.bush) {
+          bushToBreak = adjacentPos;
+          break; // Нашли куст для ломания
+        }
+      }
+      if (bushToBreak != null) break;
+    }
+
+    if (bushToBreak == null) {
+      _gameState!.addMessage("Рядом нет кустов, которые можно сломать.");
+      return;
+    }
+
+    setState(() {
+      // Всегда используем _overriddenTiles для всех типов карт.
+      // Это позволит "сломать" куст и на фиксированных картах, и на процедурных.
+      _gameState!._overriddenTiles[bushToBreak!] = TileType.empty;
+
+      _gameState!.addMessage("Вы сломали куст!");
+
+      // Добавляем палки и листья в инвентарь
+      _addOrUpdateInventoryItem(InventoryItem.fromType(ItemType.sticks));
+      _addOrUpdateInventoryItem(InventoryItem.fromType(ItemType.leaves));
+      _gameState!.addMessage("Вы получили палки и листья.");
+    });
+  }
+
+  /// Обработка действия по рубке дерева
+  void _chopTreeAction() {
+    if (_gameState == null || _gameState!.isGameOver) return;
+
+    final Player player = _gameState!.player;
+    Position playerPos = player.position;
+
+    // Ищем топор (обычный или каменный) в инвентаре с прочностью > 0
+    final InventoryItem? usableAxe = player.inventory.firstWhereOrNull(
+      (InventoryItem item) =>
+          (item.itemType == ItemType.axe || item.itemType == ItemType.stoneAxe) &&
+          (item.currentDurability ?? 0) > 0,
+    );
+
+    if (usableAxe == null) {
+      _gameState!.addMessage("Вам нужен целый топор, чтобы срубить дерево.");
+      return;
+    }
+
+    Position? treeToChop; // Используем nullable Position для поиска
+    // Ищем дерево на соседних клетках (3x3 область вокруг игрока)
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) continue; // Пропускаем позицию самого игрока
+
+        Position adjacentPos = Position(playerPos.x + dx, playerPos.y + dy);
+
+        // Проверяем границы карты для фиксированных размеров
+        if (_gameState!.selectedMapSizeOption != MapSizeOption.infinite &&
+            (adjacentPos.x < 0 || adjacentPos.x >= _gameState!.mapWidth ||
+             adjacentPos.y < 0 || adjacentPos.y >= _gameState!.mapHeight)) {
+          continue;
+        }
+
+        // Используем _getTileTypeAt для определения типа тайла
+        if (_gameState!._getTileTypeAt(adjacentPos.x, adjacentPos.y) == TileType.tree) {
+          treeToChop = adjacentPos;
+          break; // Нашли дерево для рубки
+        }
+      }
+      if (treeToChop != null) break;
+    }
+
+    if (treeToChop == null) {
+      _gameState!.addMessage("Рядом нет деревьев, которые можно срубить.");
+      return;
+    }
+
+    setState(() {
+      // Всегда используем _overriddenTiles для всех типов карт.
+      _gameState!._overriddenTiles[treeToChop!] = TileType.empty;
+
+      _gameState!.addMessage("Вы срубили дерево!");
+
+      // Уменьшаем прочность топора
+      usableAxe.currentDurability = (usableAxe.currentDurability ?? 0) - 1;
+      _gameState!.addMessage(
+          "Прочность ${usableAxe.name}: ${usableAxe.currentDurability}/${usableAxe.maxDurability}.");
+
+      if (usableAxe.currentDurability! <= 0) {
+        _gameState!.player.inventory.remove(usableAxe); // Удаляем сломанный топор
+        _gameState!.addMessage("Ваш ${usableAxe.name} сломался!");
+      }
+
+      // Добавляем х2 палки, х2 листья и 1 бревно в инвентарь
+      _addOrUpdateInventoryItem(InventoryItem.fromType(ItemType.sticks)..quantity = 2);
+      _addOrUpdateInventoryItem(InventoryItem.fromType(ItemType.leaves)..quantity = 2);
+      _addOrUpdateInventoryItem(InventoryItem.fromType(ItemType.log));
+      _gameState!.addMessage("Вы получили 2 палки, 2 листа и 1 бревно.");
+    });
+  }
+
+  /// Обработка действия по открытию ящика
+  void _openChestAction() {
+    if (_gameState == null || _gameState!.isGameOver) return;
+
+    final Player player = _gameState!.player;
+    Position playerPos = player.position;
+
+    // Ищем доступный лом или улучшенный лом с прочностью > 0
+    final InventoryItem? usableCrowbar = player.inventory.firstWhereOrNull(
+      (InventoryItem item) =>
+          (item.itemType == ItemType.crowbar || item.itemType == ItemType.improvedCrowbar) &&
+          (item.currentDurability ?? 0) > 0,
+    );
+
+    if (usableCrowbar == null) {
+      _gameState!.addMessage("Вам нужен целый лом, чтобы открыть ящик.");
+      return;
+    }
+
+    // Ищем ящик на соседних клетках
+    List<Position> adjacentChestPositions = <Position>[];
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) continue; // Пропускаем позицию самого игрока
+
+        Position adjacentPos = Position(playerPos.x + dx, playerPos.y + dy);
+
+        if (adjacentPos.x >= 0 &&
+            adjacentPos.x < _gameState!.mapWidth && // These mapWidth/Height are for conceptual boundaries
+            adjacentPos.y >= 0 &&
+            adjacentPos.y < _gameState!.mapHeight &&
+            _gameState!.chests.any((Position c) => c == adjacentPos)) {
+          adjacentChestPositions.add(adjacentPos);
+        }
+      }
+    }
+
+    if (adjacentChestPositions.isEmpty) {
+      _gameState!.addMessage("Рядом нет ящиков, которые можно открыть.");
+      return;
+    }
+
+    // Открываем первый найденный ящик
+    Position chestToOpen = adjacentChestPositions.first;
+
+    setState(() {
+      _gameState!.chests.removeWhere((Position c) => c == chestToOpen);
+      _gameState!.addMessage("Вы открыли ящик!");
+
+      // Уменьшаем прочность лома
+      usableCrowbar.currentDurability = (usableCrowbar.currentDurability ?? 0) - 1;
+      _gameState!.addMessage(
+          "Прочность ${usableCrowbar.name}: ${usableCrowbar.currentDurability}/${usableCrowbar.maxDurability}.");
+
+      if (usableCrowbar.currentDurability! <= 0) {
+        _gameState!.player.inventory.remove(usableCrowbar); // Удаляем сломанный лом
+        _gameState!.addMessage("Ваш ${usableCrowbar.name} сломался!");
+      }
+
+      // Добавляем случайный предмет из списка в инвентарь
+      ItemType randomItemType;
+      // 10% шанс выпадения топора, если он еще не выпадал
+      if (_gameState!._random.nextDouble() < 0.1 && !_hasAxeBeenDropped) {
+        randomItemType = ItemType.axe;
+        _hasAxeBeenDropped = true;
+      } else {
+        // Выбираем из основного списка, который не содержит топора
+        List<ItemType> filteredPossibleItems = List<ItemType>.from(_chestPossibleItems);
+        filteredPossibleItems.remove(ItemType.axe); // Axe is handled by the special chance
+        randomItemType = filteredPossibleItems[_gameState!._random.nextInt(filteredPossibleItems.length)];
+      }
+
+      InventoryItem foundItem = InventoryItem.fromType(randomItemType);
+      
+      // Если это патроны, то выдаем их в количестве от 1 до 5
+      if (foundItem.itemType == ItemType.ammo) {
+        foundItem.quantity = _gameState!._random.nextInt(5) + 1; // 1-5 патронов
+      } else if (foundItem.itemType == ItemType.sticks || foundItem.itemType == ItemType.leaves) {
+        foundItem.quantity = _gameState!._random.nextInt(3) + 1; // 1-3 для палок/листьев
+      } else if (foundItem.itemType == ItemType.log || foundItem.itemType == ItemType.stones) { // НОВОЕ: Бревно и камни
+        foundItem.quantity = 1; // Бревно и камни всегда 1
+      }
+
+      _addOrUpdateInventoryItem(foundItem);
+      _gameState!.addMessage("Вы нашли ${foundItem.name} (x${foundItem.quantity})!");
+
+      Provider.of<GameAchievementsData>(context, listen: false).recordFirstChestOpened();
+    });
+  }
+
+  /// НОВОЕ: Обработка действия по разбиванию валуна
+  void _breakBoulderAction() {
+    if (_gameState == null || _gameState!.isGameOver) return;
+
+    final Player player = _gameState!.player;
+    Position playerPos = player.position;
+
+    // Ищем доступный лом или улучшенный лом с прочностью > 0
+    final InventoryItem? usableCrowbar = player.inventory.firstWhereOrNull(
+      (InventoryItem item) =>
+          (item.itemType == ItemType.crowbar || item.itemType == ItemType.improvedCrowbar) &&
+          (item.currentDurability ?? 0) > 0,
+    );
+
+    if (usableCrowbar == null) {
+      _gameState!.addMessage("Вам нужен целый лом, чтобы разбить валун.");
+      return;
+    }
+
+    Position? boulderToBreak;
+    // Ищем валун на соседних клетках (3x3 область вокруг игрока)
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) continue;
+
+        Position adjacentPos = Position(playerPos.x + dx, playerPos.y + dy);
+
+        if (_gameState!.selectedMapSizeOption != MapSizeOption.infinite &&
+            (adjacentPos.x < 0 || adjacentPos.x >= _gameState!.mapWidth ||
+             adjacentPos.y < 0 || adjacentPos.y >= _gameState!.mapHeight)) {
+          continue;
+        }
+
+        if (_gameState!._getTileTypeAt(adjacentPos.x, adjacentPos.y) == TileType.boulder) {
+          boulderToBreak = adjacentPos;
+          break;
+        }
+      }
+      if (boulderToBreak != null) break;
+    }
+
+    if (boulderToBreak == null) {
+      _gameState!.addMessage("Рядом нет валунов, которые можно разбить.");
+      return;
+    }
+
+    setState(() {
+      // Для фиксированных карт удаляем из списка boulders
+      if (_gameState!.selectedMapSizeOption != MapSizeOption.infinite) {
+        _gameState!.boulders.removeWhere((Position b) => b == boulderToBreak);
+      }
+      // Для всех карт (включая процедурные) используем _overriddenTiles
+      _gameState!._overriddenTiles[boulderToBreak!] = TileType.empty;
+
+      _gameState!.addMessage("Вы разбили валун!");
+
+      // Уменьшаем прочность лома
+      usableCrowbar.currentDurability = (usableCrowbar.currentDurability ?? 0) - 1;
+      _gameState!.addMessage(
+          "Прочность ${usableCrowbar.name}: ${usableCrowbar.currentDurability}/${usableCrowbar.maxDurability}.");
+
+      if (usableCrowbar.currentDurability! <= 0) {
+        _gameState!.player.inventory.remove(usableCrowbar);
+        _gameState!.addMessage("Ваш ${usableCrowbar.name} сломался!");
+      }
+
+      // Добавляем камни в инвентарь
+      _addOrUpdateInventoryItem(InventoryItem.fromType(ItemType.stones));
+      _gameState!.addMessage("Вы получили камни.");
+    });
+  }
+
+  /// Обработка действия по стрельбе из пистолета
+  void _shootAction() {
+    if (_gameState == null || _gameState!.isGameOver) return;
+
+    final Player player = _gameState!.player;
+
+    // Проверяем наличие пистолета
+    final InventoryItem? pistolItem = player.inventory.firstWhereOrNull(
+      (InventoryItem item) => item.itemType == ItemType.pistol,
+    );
+
+    if (pistolItem == null) {
+      _gameState!.addMessage("У вас нет пистолета.");
+      return;
+    }
+
+    // Проверяем наличие патронов
+    final InventoryItem? ammoItem = player.inventory.firstWhereOrNull(
+      (InventoryItem item) => item.itemType == ItemType.ammo,
+    );
+
+    if (ammoItem == null || ammoItem.quantity <= 0) {
+      _gameState!.addMessage("Нет патронов.");
+      return;
+    }
+
+    // Находим ближайшего зомби в радиусе стрельбы
+    Zombie? targetZombie = _gameState!.findNearestZombieInRange(player.position, PISTOL_RANGE);
+
+    if (targetZombie == null) {
+      _gameState!.addMessage("Рядом нет зомби в радиусе стрельбы.");
+      return;
+    }
+
+    setState(() {
+      // Расходуем патрон
+      _removeStackableInventoryItem(ItemType.ammo, 1);
+      _gameState!.addMessage("Вы выстрелили в зомби!");
+
+      // Наносим урон
+      _combat(pistolItem, targetZombie, true); // Передаем pistolItem как "атакующего" для получения урона
+
+      // Если зомби умер, удаляем его
+      if (!targetZombie.isAlive()) {
+        Provider.of<GameAchievementsData>(context, listen: false).recordFirstZombieKill();
+        Provider.of<GameAchievementsData>(context, listen: false).recordFirstPistolKill(); // Достижение за убийство пистолетом
+        _gameState!.zombies.remove(targetZombie);
+        _gameState!.addMessage("Зомби уничтожен выстрелом!");
+        if (_gameState!.zombies.isEmpty) {
+          _gameState!.addMessage("Все зомби уничтожены! Вы победили!");
+          _gameState!.isGameOver = true;
+        }
+      }
+    });
+  }
+
+  /// Добавляет или обновляет предмет в инвентаре игрока
+  void _addOrUpdateInventoryItem(InventoryItem newItem) {
+    if (newItem.itemType == ItemType.crowbar ||
+        newItem.itemType == ItemType.axe ||
+        newItem.itemType == ItemType.improvedCrowbar ||
+        newItem.itemType == ItemType.stoneAxe) { // НОВОЕ: Каменный топор не стакается
+      // Ломы, топоры и улучшенные ломы не стакаются, каждый имеет свою прочность.
+      _gameState!.player.inventory.add(newItem);
+    } else {
+      // Для остальных предметов используем старую логику стаканья
+      InventoryItem? existingItem = _gameState!.player.inventory.firstWhereOrNull(
+        (InventoryItem item) => item.itemType == newItem.itemType,
+      );
+
+      if (existingItem != null) {
+        existingItem.quantity += newItem.quantity;
+      } else {
+        _gameState!.player.inventory.add(newItem);
+      }
+    }
+  }
+
+  /// Удаляет стакаемый предмет из инвентаря игрока
+  void _removeStackableInventoryItem(ItemType itemType, int quantity) {
+    final InventoryItem? itemToRemove = _gameState!.player.inventory.firstWhereOrNull(
+      (InventoryItem item) => item.itemType == itemType,
+    );
+
+    if (itemToRemove != null && itemToRemove.quantity >= quantity) {
+      itemToRemove.quantity -= quantity;
+      if (itemToRemove.quantity <= 0) {
+        _gameState!.player.inventory.remove(itemToRemove);
+      }
+    } else {
+      _gameState!.addMessage("Ошибка: Недостаточно ${InventoryItem.fromType(itemType).name} для удаления.");
+    }
+  }
+
+  /// Удаляет единичный предмет с прочностью из инвентаря игрока (для крафта)
+  void _removeDurabilityItemForCrafting(ItemType itemType) {
+    final InventoryItem? itemToRemove = _gameState!.player.inventory.firstWhereOrNull(
+        (InventoryItem item) => item.itemType == itemType && (item.currentDurability ?? 1) > 0
+    );
+    if (itemToRemove != null) {
+      _gameState!.player.inventory.remove(itemToRemove);
+    } else {
+      _gameState!.addMessage("Ошибка: Не удалось найти целый ${InventoryItem.fromType(itemType).name} для крафта.");
+    }
+  }
+
+
+  /// Логика хода зомби
+  void _zombieTurn() {
+    List<Zombie> activeZombies = List<Zombie>.from(
+        _gameState!.zombies); // Избегаем модификации списка во время итерации
+    for (var zombie in activeZombies) {
+      if (!zombie.isAlive()) continue;
+
+      int playerX = _gameState!.player.position.x;
+      int playerY = _gameState!.player.position.y;
+      int zombieX = zombie.position.x;
+      int zombieY = zombie.position.y;
+
+      if (_gameState!.isPlayerInZombieVision(zombie)) {
+        // Зомби видит игрока, движется к ему
+        int dx = 0;
+        int dy = 0;
+
+        // Определяем направление к игроку
+        if (playerX > zombieX) dx = 1;
+        else if (playerX < zombieX) dx = -1;
+
+        if (playerY > zombieY) dy = 1;
+        else if (playerY < zombieY) dy = -1;
+
+        // Потенциальные шаги (приоритет: диагональ, потом кардинальные, потом остаться на месте)
+        List<Position> potentialMoves = <Position>[];
+        if (dx != 0 && dy != 0) {
+          potentialMoves.add(Position(zombieX + dx, zombieY + dy)); // Диагональ
+        }
+        if (dx != 0) {
+          potentialMoves.add(Position(zombieX + dx, zombieY)); // Горизонталь
+        }
+        if (dy != 0) {
+          potentialMoves.add(Position(zombieX, zombieY + dy)); // Вертикаль
+        }
+        potentialMoves.add(Position(zombieX, zombieY)); // Остаться на месте (если некуда идти)
+
+        for (Position nextPos in potentialMoves) {
+          // Если целевая позиция - это игрок, атакуем его
+          if (nextPos.x == playerX && nextPos.y == playerY) {
+            _combat(zombie, _gameState!.player, false);
+            break; // Зомби сделал свое действие, переходим к следующему зомби
+          }
+
+          // Если не игрок, проверяем, проходима ли позиция по ландшафту
+          if (!_gameState!._isTerrainWalkable(nextPos.x, nextPos.y)) {
+            continue; // Нельзя идти через стену, куст, ящик, дерево или валун
+          }
+
+          // Проверяем, не занята ли клетка другим зомби
+          bool isOccupiedByAnotherZombie = _gameState!.zombies.any(
+              (Zombie otherZombie) =>
+                  otherZombie.position == nextPos && otherZombie != zombie);
+
+          if (isOccupiedByAnotherZombie) {
+            continue; // Нельзя идти сквозь другого зомби
+          }
+
+          // Проверяем, не занята ли клетка предметами. Зомби не должны наступать на предметы.
+          bool isOccupiedByItem =
+              _gameState!.healthPacks.any((Position hp) => hp == nextPos) ||
+              _gameState!.knives.any((Position k) => k == nextPos) ||
+              _gameState!.defenseItems.any((Position d) => d == nextPos);
+
+          if (!isOccupiedByItem) {
+            // Иначе, двигаемся на свободную позицию, не наезжая на предметы
+            zombie.position = nextPos;
+            break; // Зомби двинулся, переходим к следующему зомби
+          }
+        }
+      } else {
+        // Зомби не видит игрока, остается на месте (или можно добавить случайное блуждание)
+        // Для простоты, если не видит игрока, зомби стоит на месте
+      }
+    }
+    // Удаляем мертвых зомби после всех ходов
+    _gameState!.zombies.removeWhere((Zombie z) => !z.isAlive());
+  }
+
+  /// Логика боя между двумя акторами
+  void _combat(dynamic attacker, Actor defender, bool isRangedAttack) {
+    if (!defender.isAlive()) return;
+
+    int damage;
+    String attackerName;
+
+    if (attacker is Actor) { // Механический бой (игрок или зомби)
+      damage = attacker.strength;
+      attackerName = attacker.char;
+    } else if (attacker is InventoryItem && attacker.itemType == ItemType.pistol) { // Атака пистолетом
+      damage = attacker.effectValue;
+      attackerName = attacker.name;
+    } else {
+      // Неизвестный тип атакующего, или не пистолет
+      _gameState!.addMessage("Ошибка: Неизвестный атакующий или некорректное использование предмета.");
+      return;
+    }
+
+    if (defender is Player) {
+      damage = max(0, damage - defender.defense); // Применяем защиту игрока
+    }
+
+    defender.health -= damage;
+    _gameState!.addMessage(
+        "${attackerName} атакует ${defender.char}! ${defender.char} получает $damage урона.");
+
+    if (!defender.isAlive()) {
+      if (defender == _gameState!.player) {
+        _gameState!.addMessage("Вы мертвы. ИГРА ОКОНЧЕНА!");
+        _gameState!.isGameOver = true;
+      } else {
+        _gameState!.addMessage("${defender.char} уничтожен!");
+      }
+    }
+  }
+
+  /// Начинает новую игру
+  void _startGame() {
+    final GameOptionsData gameOptions = Provider.of<GameOptionsData>(context, listen: false);
+    final GameAchievementsData achievementsData = Provider.of<GameAchievementsData>(context, listen: false);
+    try {
+      final int selectedMapDimension = gameOptions.mapSize.size;
+      final GameState newGameState = GameState(
+        initialZombies: gameOptions.numberOfZombies,
+        initialHealthPacks: gameOptions.numberOfHealthPacks,
+        initialKnives: gameOptions.numberOfKnives,
+        initialDefenseItems: gameOptions.numberOfDefenseItems,
+        initialBushes: gameOptions.numberOfBushes,
+        initialChests: gameOptions.numberOfChests,
+        initialTrees: gameOptions.numberOfTrees,
+        initialBoulders: gameOptions.numberOfBoulders, // НОВОЕ: Передаем количество валунов
+        mapWidth: selectedMapDimension,
+        mapHeight: selectedMapDimension,
+        selectedMapSizeOption: gameOptions.mapSize, // Pass the selected MapSizeOption
+      );
+      setState(() {
+        _gameState = newGameState;
+        _gameState!.updateExploredTiles(); // Открываем начальную область
+        _currentScreen = AppScreen.game;
+        _isZoomedToPlayer = false; // Сброс приближения при новой игре
+        _hasAxeBeenDropped = false; // Сброс флага топора
+        _showExitConfirmation = false; // NEW: Reset confirmation banner state
+        _focusNode.requestFocus(); // Запрашиваем фокус, когда игра начинается
+      });
+      achievementsData.recordFirstGameStart();
+    } catch (e, stackTrace) {
+      print("Error starting new game: $e\n$stackTrace");
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Ошибка при запуске новой игры: ${e.toString()}"),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  /// Перезапускает игру
+  void _restartGame() {
+    final GameOptionsData gameOptions = Provider.of<GameOptionsData>(context, listen: false);
+    try {
+      final int selectedMapDimension = gameOptions.mapSize.size;
+      final GameState newGameState = GameState(
+        initialZombies: gameOptions.numberOfZombies,
+        initialHealthPacks: gameOptions.numberOfHealthPacks,
+        initialKnives: gameOptions.numberOfKnives,
+        initialDefenseItems: gameOptions.numberOfDefenseItems,
+        initialBushes: gameOptions.numberOfBushes,
+        initialChests: gameOptions.numberOfChests,
+        initialTrees: gameOptions.numberOfTrees,
+        initialBoulders: gameOptions.numberOfBoulders, // НОВОЕ: Передаем количество валунов
+        mapWidth: selectedMapDimension,
+        mapHeight: selectedMapDimension,
+        selectedMapSizeOption: gameOptions.mapSize, // Pass the selected MapSizeOption
+      );
+      setState(() {
+        _gameState = newGameState;
+        _gameState!.updateExploredTiles(); // Открываем начальную область при перезапуске
+        _currentScreen = AppScreen.game; // При перезапуске всегда переходим на экран игры
+        _isZoomedToPlayer = false; // Сброс приближения при перезапуске
+        _hasAxeBeenDropped = false; // Сброс флага топора
+        _showExitConfirmation = false; // NEW: Reset confirmation banner state
+        _focusNode.requestFocus(); // Убеждаемся, что фокус сохраняется для новой игры
+      });
+    } catch (e, stackTrace) {
+      print("Error restarting game: $e\n$stackTrace");
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Ошибка при перезапуске игры: ${e.toString()}"),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  /// Переходит на экран настроек игры
+  void _navigateToGameOptions() {
+    setState(() {
+      _currentScreen = AppScreen.gameOptions;
+    });
+  }
+
+  /// Переходит на экран инвентаря
+  void _navigateToInventory() {
+    setState(() {
+      _currentScreen = AppScreen.inventory;
+    });
+  }
+
+  /// Переходит на экран достижений
+  void _navigateToAchievements() {
+    setState(() {
+      _currentScreen = AppScreen.achievements;
+    });
+  }
+
+  /// Переходит на экран крафта
+  void _navigateToCrafting() {
+    setState(() {
+      _currentScreen = AppScreen.crafting;
+    });
+  }
+
+  /// Переходит на экран управления
+  void _navigateToControls() {
+    setState(() {
+      _currentScreen = AppScreen.controls;
+    });
+  }
+
+  /// Возвращается в главное меню
+  void _backToMainMenu() {
+    setState(() {
+      _currentScreen = AppScreen.mainMenu;
+      _focusNode.requestFocus(); // Возвращаем фокус на меню
+    });
+  }
+
+  /// Возвращается в игру
+  void _backToGame() {
+    setState(() {
+      _currentScreen = AppScreen.game;
+      _focusNode.requestFocus(); // Возвращаем фокус на игру
+    });
+  }
+
+  // NEW: Confirm exit to main menu
+  void _confirmExitGame() {
+    setState(() {
+      _showExitConfirmation = false;
+    });
+    _backToMainMenu(); // Proceed to main menu
+  }
+
+  // NEW: Cancel exit to main menu
+  void _cancelExitGame() {
+    setState(() {
+      _showExitConfirmation = false;
+    });
+    _focusNode.requestFocus(); // Re-focus on game
+  }
+
+
+  /// Использует предмет из инвентаря
+  void _useInventoryItem(InventoryItem item, int quantity) {
+    if (_gameState == null || quantity <= 0 || quantity > item.quantity) {
+      return;
+    }
+
+    final GameAchievementsData achievementsData = Provider.of<GameAchievementsData>(context, listen: false);
+
+    setState(() {
+      switch (item.itemType) {
+        case ItemType.healthPack:
+        case ItemType.primitiveBandage:
+          int healthRestored = item.effectValue * quantity;
+          _gameState!.player.health = min(100, _gameState!.player.health + healthRestored);
+          _gameState!.addMessage(
+              "Вы использовали $quantity ${item.name}. Здоровье восстановлено на $healthRestored!");
+          achievementsData.recordFirstHealthPackUse();
+          // Расходуемые предметы
+          item.quantity -= quantity;
+          if (item.quantity <= 0) {
+            _gameState!.player.inventory.remove(item);
+          }
+          break;
+        case ItemType.knife:
+        case ItemType.sharpLongStick:
+        case ItemType.longKnife:
+          int strengthBoost = item.effectValue * quantity;
+          _gameState!.player.strength += strengthBoost;
+          _gameState!.addMessage(
+              "Вы использовали $quantity ${item.name}. Ваша сила увеличилась на $strengthBoost!");
+          achievementsData.recordFirstKnifeUse(); // Учитываем любое увеличение урона как использование ножа
+          // Расходуемые предметы
+          item.quantity -= quantity;
+          if (item.quantity <= 0) {
+            _gameState!.player.inventory.remove(item);
+          }
+          break;
+        case ItemType.defenseBoost:
+        case ItemType.leafArmor:
+        case ItemType.woodenShield:
+          int defenseBoost = item.effectValue * quantity;
+          _gameState!.player.defense += defenseBoost;
+          _gameState!.addMessage(
+              "Вы использовали $quantity ${item.name}. Ваша защита увеличилась на $defenseBoost!");
+          // Расходуемые предметы
+          item.quantity -= quantity;
+          if (item.quantity <= 0) {
+            _gameState!.player.inventory.remove(item);
+          }
+          break;
+        case ItemType.sticks:
+        case ItemType.leaves:
+        case ItemType.crowbar:
+        case ItemType.pistol:
+        case ItemType.ammo:
+        case ItemType.axe:
+        case ItemType.log:
+        case ItemType.improvedCrowbar:
+        case ItemType.stones: // НОВОЕ: Камни нельзя использовать напрямую
+        case ItemType.stoneAxe: // НОВОЕ: Каменный топор нельзя использовать напрямую
+          // Эти предметы ничего не делают при непосредственном использовании
+          _gameState!.addMessage("Предмет '${item.name}' ничего не делает при использовании.");
+          break;
+      }
+      _currentScreen = AppScreen.game; // Возвращаемся в игру после использования
+      _focusNode.requestFocus(); // Возвращаем фокус на игру
+    });
+  }
+
+  /// Создает предмет из рецепта
+  void _craftItem(CraftingRecipe recipe) {
+    if (_gameState == null || _gameState!.isGameOver) return;
+
+    final Player player = _gameState!.player;
+    if (!recipe.canCraft(player)) {
+      _gameState!.addMessage("Недостаточно компонентов для создания ${recipe.craftedItemName}.");
+      return;
+    }
+
+    final GameAchievementsData achievementsData = Provider.of<GameAchievementsData>(context, listen: false);
+
+    setState(() {
+      // Расходуем компоненты
+      for (MapEntry<ItemType, int> entry in recipe.requiredComponents.entries) {
+        final ItemType requiredType = entry.key;
+        final int requiredQuantity = entry.value;
+
+        // Отдельная логика для удаления предметов с прочностью (не стакающихся)
+        if (requiredType == ItemType.crowbar ||
+            requiredType == ItemType.axe ||
+            requiredType == ItemType.improvedCrowbar ||
+            requiredType == ItemType.stoneAxe) { // НОВОЕ: Каменный топор
+          for (int i = 0; i < requiredQuantity; i++) {
+            _removeDurabilityItemForCrafting(requiredType);
+          }
+        } else {
+          // Стакаемые предметы
+          _removeStackableInventoryItem(requiredType, requiredQuantity);
+        }
+      }
+
+      // Добавляем созданный предмет
+      InventoryItem crafted = InventoryItem.fromType(recipe.craftedItemType);
+      _addOrUpdateInventoryItem(crafted);
+      _gameState!.addMessage("Вы создали ${crafted.name}!");
+      achievementsData.recordFirstItemCrafted(); // Запись достижения
+
+      // Крафт занимает ход, поэтому зомби двигаются
+      _gameState!.turns++;
+      if (!_gameState!.isGameOver) { // Проверяем, не закончилась ли игра после хода игрока/крафта
+        _zombieTurn();
+      }
+      _gameState!.updateExploredTiles(); // Обновляем исследованные тайлы после крафта
+
+      _backToGame(); // Возвращаемся в игру после крафта
+    });
+  }
+
+  /// Выход из приложения
+  void _exitGame() {
+    SystemNavigator.pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: RawKeyboardListener(
+        focusNode: _focusNode, // Используем наш FocusNode
+        onKey: _handleKeyEvent,
+        autofocus: true, // Автоматически фокусируется при монтировании
+        child: Builder(
+          builder: (BuildContext innerContext) {
+            final GameOptionsData gameOptions = Provider.of<GameOptionsData>(innerContext);
+            switch (_currentScreen) {
+              case AppScreen.mainMenu:
+                return MainMenuWidget(
+                  onNewGame: _startGame,
+                  onExit: _exitGame,
+                  onGameOptions: _navigateToGameOptions,
+                  onAchievements: _navigateToAchievements,
+                  onControls: _navigateToControls,
+                );
+              case AppScreen.gameOptions:
+                return GameOptionsWidget(
+                  onBackToMainMenu: _backToMainMenu,
+                );
+              case AppScreen.achievements:
+                return AchievementsScreenWidget(
+                  onBackToMainMenu: _backToMainMenu,
+                );
+              case AppScreen.controls:
+                return ControlsScreenWidget(
+                  onBackToMainMenu: _backToMainMenu,
+                );
+              case AppScreen.inventory:
+                if (_gameState == null) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                return InventoryScreenWidget(
+                  gameState: _gameState!,
+                  onBack: _backToGame,
+                  onUseItem: _useInventoryItem,
+                );
+              case AppScreen.crafting:
+                if (_gameState == null) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                return CraftingScreenWidget(
+                  gameState: _gameState!,
+                  onBack: _backToGame,
+                  onCraftItem: _craftItem,
+                );
+              case AppScreen.game:
+                if (_gameState == null) {
+                  return const Center(
+                      child: CircularProgressIndicator()); // Безопасное возвращение
+                }
+                return Stack(
+                  children: <Widget>[
+                    GameScreenContent(
+                      gameState: _gameState!,
+                      isZoomedToPlayer: _isZoomedToPlayer,
+                      onRestartGame: _restartGame,
+                      onOpenInventory: _navigateToInventory,
+                      onBackToMainMenu: _gameState!.isGameOver // If game is over, no need for confirmation
+                          ? _backToMainMenu
+                          : () { // If game is not over, show confirmation
+                              setState(() {
+                                _showExitConfirmation = true;
+                              });
+                            },
+                      onOpenCrafting: _navigateToCrafting,
+                      isFogOfWarEnabled: gameOptions.isFogOfWarEnabled,
+                    ),
+                    if (_showExitConfirmation)
+                      ExitConfirmationOverlay(
+                        onConfirm: _confirmExitGame,
+                        onCancel: _cancelExitGame,
+                      ),
+                  ],
+                );
+            }
+          },
+        ),
+      ),
+    );
+  }
+}
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Zombie Roguelike',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+      ),
+      home: MultiProvider(
+        providers: [
+          ChangeNotifierProvider<GameOptionsData>(
+            create: (BuildContext context) => GameOptionsData(),
+          ),
+          ChangeNotifierProvider<GameAchievementsData>(
+            create: (BuildContext context) => GameAchievementsData(),
+          ),
+          ChangeNotifierProvider<GameControlsData>(
+            create: (BuildContext context) => GameControlsData(),
+          ),
+        ],
+        builder: (BuildContext context, Widget? child) => const ZombieRoguelikeGame(),
+      ),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
