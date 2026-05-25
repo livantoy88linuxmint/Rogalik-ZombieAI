@@ -1,0 +1,1 @@
+- Hello, this is my game, created using a neural network agent in Dartpad. Before using it, you need to compile it because I'm LAZY.
