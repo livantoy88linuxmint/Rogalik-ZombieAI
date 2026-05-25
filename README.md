@@ -1,1 +1,2 @@
-- Hello, this is my game, created using a neural network agent in Dartpad. Before using it, you need to compile it because I'm LAZY.
+- Rogalik-ZombieAI: this is a mini roguelike created using the Dart pad using a neural network. The game is made to explore the possibility of creating a game similar to CDDA (Cataclysm: Dark Days Ahead) using AI ((as you can see, I've encountered a technical barrier)) I've provided the source code for you to compile and use. 
+- Before launching, copy the game from the game because I'm a lazy ass :>
